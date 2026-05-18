@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>WikiFold Graph Viewer</title>
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Courier New', monospace;
+      background: #08080f;
+      color: #b0b0c0;
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* --- Sidebar --- */
+    #sidebar {
+      width: 240px;
+      flex-shrink: 0;
+      border-right: 1px solid #1a1a28;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    #sidebar-header {
+      padding: 14px 16px 12px;
+      border-bottom: 1px solid #1a1a28;
+    }
+
+    #sidebar-header h1 {
+      font-size: 12px;
+      color: #ffd700;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+    }
+
+    #sidebar-header .sub {
+      font-size: 10px;
+      color: #383848;
+      margin-top: 3px;
+      letter-spacing: 1px;
+    }
+
+    #stats {
+      padding: 10px 16px;
+      border-bottom: 1px solid #111120;
+      font-size: 11px;
+      line-height: 2;
+      color: #3a3a50;
+    }
+    #stats span { color: #9090b0; }
+
+    #controls {
+      padding: 12px 16px;
+      border-bottom: 1px solid #111120;
+    }
+
+    .section-label {
+      font-size: 9px;
+      color: #383848;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      margin-bottom: 8px;
+    }
+
+    .toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 5px;
+      cursor: pointer;
+      font-size: 11px;
+      color: #6060808;
+    }
+    .toggle { color: #606080; }
+    .toggle input { accent-color: #ffd700; cursor: pointer; }
+
+    #legend {
+      padding: 12px 16px;
+      border-bottom: 1px solid #111120;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-bottom: 4px;
+      font-size: 10px;
+      color: #505065;
+    }
+
+    .legend-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .legend-line {
+      width: 18px;
+      height: 2px;
+      flex-shrink: 0;
+    }
+
+    #detail {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px 14px;
+    }
+
+    #detail.empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #detail-placeholder {
+      text-align: center;
+      color: #252535;
+      font-size: 11px;
+      line-height: 2;
+    }
+
+    .d-title {
+      font-size: 12px;
+      color: #d0d0e0;
+      line-height: 1.4;
+      margin-bottom: 8px;
+    }
+
+    .d-badge {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 2px;
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 10px;
+    }
+
+    .d-section {
+      font-size: 9px;
+      color: #383848;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      margin: 10px 0 5px;
+    }
+
+    .d-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      font-size: 10px;
+      padding: 2px 0;
+      border-bottom: 1px solid #0f0f18;
+      gap: 6px;
+    }
+    .d-row .lbl { color: #383848; white-space: nowrap; }
+    .d-row .val { color: #8888a8; text-align: right; word-break: break-word; }
+
+    .d-hook {
+      margin-top: 10px;
+      padding: 9px 10px;
+      background: #0d0d1a;
+      border-left: 2px solid #ffd700;
+      font-size: 10px;
+      color: #9090a8;
+      line-height: 1.7;
+      font-style: italic;
+    }
+
+    .sbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin: 2px 0;
+      font-size: 10px;
+    }
+    .sbar .lbl { color: #383848; width: 46px; }
+    .sbar .track { flex: 1; height: 3px; background: #151520; border-radius: 2px; }
+    .sbar .fill  { height: 100%; border-radius: 2px; }
+    .sbar .num   { color: #505065; width: 16px; text-align: right; font-size: 9px; }
+
+    .d-tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-top: 4px;
+    }
+    .d-tag {
+      padding: 1px 6px;
+      background: #0f0f1a;
+      border: 1px solid #1e1e30;
+      border-radius: 2px;
+      font-size: 9px;
+      color: #505070;
+    }
+
+    /* --- Main canvas --- */
+    #main { flex: 1; position: relative; overflow: hidden; }
+
+    svg { width: 100%; height: 100%; }
+
+    .link { fill: none; }
+    .link.structural { stroke: #1c1c2c; stroke-width: 1; stroke-opacity: 0.7; }
+    .link.inferred   { stroke-width: 1.5; stroke-opacity: 0.55; }
+
+    .node circle { cursor: pointer; }
+    .node circle.frontier   { stroke: #111120; stroke-width: 1; }
+    .node circle.classified { stroke-width: 1.5; }
+    .node.selected circle   { stroke: #ffd700 !important; stroke-width: 2.5 !important; }
+
+    .node-label {
+      font-size: 9px;
+      fill: #555568;
+      pointer-events: none;
+      text-anchor: middle;
+    }
+
+    #tooltip {
+      position: absolute;
+      background: #0d0d1a;
+      border: 1px solid #252535;
+      padding: 6px 9px;
+      font-size: 10px;
+      color: #9090a8;
+      border-radius: 3px;
+      pointer-events: none;
+      max-width: 200px;
+      line-height: 1.5;
+      opacity: 0;
+      transition: opacity 0.1s;
+      z-index: 5;
+    }
+
+    /* --- Load overlay --- */
+    #load-overlay {
+      position: absolute;
+      inset: 0;
+      background: #08080f;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      z-index: 20;
+    }
+
+    #load-overlay h2 { color: #ffd700; font-size: 13px; letter-spacing: 4px; }
+
+    #load-overlay p {
+      color: #303040;
+      font-size: 10px;
+      text-align: center;
+      line-height: 2;
+      white-space: pre-line;
+    }
+
+    #file-btn {
+      padding: 9px 18px;
+      border: 1px solid #303040;
+      color: #505060;
+      font-size: 10px;
+      letter-spacing: 1px;
+      cursor: pointer;
+      text-transform: uppercase;
+      font-family: inherit;
+      background: none;
+    }
+    #file-btn:hover { border-color: #ffd700; color: #ffd700; }
+    #file-input { display: none; }
+
+    ::-webkit-scrollbar { width: 3px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #1a1a28; }
+  </style>
+</head>
+<body>
+
+<div id="sidebar">
+  <div id="sidebar-header">
+    <h1>WikiFold</h1>
+    <div class="sub">Graph Viewer</div>
+  </div>
+
+  <div id="stats">
+    Classified &nbsp;<span id="s-classified">-</span><br>
+    Frontier &nbsp;&nbsp;&nbsp;<span id="s-frontier">-</span><br>
+    Edges &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span id="s-edges">-</span><br>
+    Domains &nbsp;&nbsp;&nbsp;<span id="s-domains">-</span>
+  </div>
+
+  <div id="controls">
+    <div class="section-label">Display</div>
+    <label class="toggle"><input type="checkbox" id="tog-frontier" checked> Frontier nodes</label>
+    <label class="toggle"><input type="checkbox" id="tog-structural" checked> Structural edges</label>
+    <label class="toggle"><input type="checkbox" id="tog-inferred" checked> Inferred edges</label>
+  </div>
+
+  <div id="legend">
+    <div class="section-label">Edge types</div>
+    <div class="legend-item"><div class="legend-line" style="background:#2a2a3c;"></div> structural</div>
+    <div class="legend-item"><div class="legend-line" style="background:#ce93d8;"></div> interpersonal</div>
+    <div class="legend-item"><div class="legend-line" style="background:#80deea;"></div> geographical</div>
+    <div class="legend-item"><div class="legend-line" style="background:#ffcc80;"></div> temporal</div>
+    <div class="legend-item"><div class="legend-line" style="background:#a5d6a7;"></div> categorical</div>
+    <div class="legend-item"><div class="legend-line" style="background:#4fc3f7;"></div> positional</div>
+    <div class="legend-item"><div class="legend-line" style="background:#b39ddb;"></div> etymological</div>
+  </div>
+
+  <div id="detail" class="empty">
+    <div id="detail-placeholder">click a node<br>to inspect it</div>
+  </div>
+</div>
+
+<div id="main">
+  <svg id="graph"></svg>
+  <div id="tooltip"></div>
+
+  <div id="load-overlay">
+    <h2>WIKIFOLD</h2>
+    <p id="overlay-msg">Loading graph.json...</p>
+    <label>
+      <button id="file-btn" onclick="document.getElementById('file-input').click()">Open graph.json</button>
+      <input type="file" id="file-input" accept=".json">
+    </label>
+  </div>
+</div>
+
+<script>
+// --- Color maps ---
+const DOMAIN_COLOR = {
+  mathematics:   '#7c6fff', physics:       '#4fc3f7', chemistry:  '#81c784',
+  biology:       '#a5d6a7', medicine:      '#ef9a9a', psychology: '#ce93d8',
+  philosophy:    '#b39ddb', linguistics:   '#80cbc4', history:    '#ffcc80',
+  politics:      '#ff8a65', economics:     '#ffd54f', law:        '#bcaaa4',
+  technology:    '#4dd0e1', computing:     '#40c4ff', engineering:'#4db6ac',
+  art:           '#f48fb1', literature:    '#ffab91', music:      '#f8bbd0',
+  film:          '#ffe082', religion:      '#e6ee9c', mythology:  '#dce775',
+  geography:     '#80deea', anthropology:  '#ffcdd2', sociology:  '#d7ccc8',
+  sports:        '#69f0ae', food:          '#ffcc80', other:      '#546e7a',
+};
+
+const EDGE_COLOR = {
+  interpersonal: '#ce93d8', geographical: '#80deea', temporal:    '#ffcc80',
+  categorical:   '#a5d6a7', etymological: '#b39ddb', positional:  '#4fc3f7',
+};
+
+// --- Bootstrap ---
+document.getElementById('file-input').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = ev => {
+    try { init(JSON.parse(ev.target.result)); }
+    catch(err) { alert('JSON parse error: ' + err.message); }
+  };
+  r.readAsText(f);
+});
+
+fetch('./graph.json')
+  .then(r => { if (!r.ok) throw new Error(r.status); return r.json(); })
+  .then(init)
+  .catch(() => {
+    document.getElementById('overlay-msg').textContent =
+      'Could not auto-load graph.json.\nServe with:  python -m http.server\nor use the file picker.';
+  });
+
+// --- Build ---
+function init(data) {
+  document.getElementById('load-overlay').style.display = 'none';
+
+  const classifiedNodes = Object.values(data.nodes   || {});
+  const frontierNodes   = Object.values(data.frontier || {});
+  const rawEdges        = data.edges || [];
+
+  // Stats
+  const domains = [...new Set(classifiedNodes.map(n => n.primary_domain).filter(Boolean))];
+  set('s-classified', classifiedNodes.length);
+  set('s-frontier',   frontierNodes.length);
+  set('s-edges',      rawEdges.length);
+  set('s-domains',    domains.length);
+
+  // Build node map
+  const nodeMap = new Map();
+  classifiedNodes.forEach(n => nodeMap.set(n.id, { ...n, _cat: 'classified' }));
+  frontierNodes.forEach(n => {
+    if (!nodeMap.has(n.id)) nodeMap.set(n.id, { ...n, _cat: 'frontier' });
+  });
+  rawEdges.forEach(e => {
+    if (!nodeMap.has(e.from)) nodeMap.set(e.from, { id: e.from, title: e.from, _cat: 'frontier' });
+    if (!nodeMap.has(e.to))   nodeMap.set(e.to,   { id: e.to,   title: e.to,   _cat: 'frontier' });
+  });
+
+  const nodes = [...nodeMap.values()];
+  const links = rawEdges.map(e => ({
+    source:      e.from,
+    target:      e.to,
+    edgeType:    e.type,
+    edgeSource:  e.source,
+    predicate:   e.predicate,
+  }));
+
+  buildViz(nodes, links);
+}
+
+function set(id, val) { document.getElementById(id).textContent = val; }
+
+// --- Visualization ---
+function buildViz(nodes, links) {
+  const container = document.getElementById('main');
+  const W = container.clientWidth;
+  const H = container.clientHeight;
+
+  const svg = d3.select('#graph');
+  svg.selectAll('*').remove();
+  svg.attr('viewBox', [0, 0, W, H]);
+
+  const root = svg.append('g');
+
+  svg.call(
+    d3.zoom().scaleExtent([0.05, 8])
+      .on('zoom', e => root.attr('transform', e.transform))
+  );
+
+  // Simulation
+  const sim = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id)
+      .distance(d => d.edgeSource === 'ai_inference' ? 100 : 55)
+      .strength(0.25))
+    .force('charge', d3.forceManyBody()
+      .strength(d => d._cat === 'classified' ? -300 : -20))
+    .force('center', d3.forceCenter(W / 2, H / 2))
+    .force('collide', d3.forceCollide().radius(d => radius(d) + 3))
+    .alphaDecay(0.018);
+
+  // Links
+  const linkG = root.append('g');
+  let linkSel = linkG.selectAll('line').data(links).join('line')
+    .attr('class', d => `link ${d.edgeSource === 'ai_inference' ? 'inferred' : 'structural'}`)
+    .style('stroke', d =>
+      d.edgeSource === 'ai_inference'
+        ? (EDGE_COLOR[d.edgeType] || '#8888aa')
+        : null
+    );
+
+  // Nodes
+  const nodeG = root.append('g');
+  let nodeSel = nodeG.selectAll('g.node').data(nodes, d => d.id).join('g')
+    .attr('class', 'node')
+    .call(dragger(sim));
+
+  nodeSel.append('circle')
+    .attr('r', radius)
+    .attr('class', d => d._cat)
+    .style('fill', d =>
+      d._cat === 'classified'
+        ? (DOMAIN_COLOR[d.primary_domain] || '#546e7a') + 'bb'
+        : '#111122')
+    .style('stroke', d =>
+      d._cat === 'classified'
+        ? (DOMAIN_COLOR[d.primary_domain] || '#546e7a') + '99'
+        : null);
+
+  // Labels only for classified nodes
+  nodeSel.filter(d => d._cat === 'classified').append('text')
+    .attr('class', 'node-label')
+    .attr('dy', d => radius(d) + 10)
+    .text(d => d.title.length > 24 ? d.title.slice(0, 24) + '...' : d.title);
+
+  // Tick
+  sim.on('tick', () => {
+    linkSel
+      .attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+      .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+    nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
+  });
+
+  // Interaction
+  const tooltip = document.getElementById('tooltip');
+  let selected = null;
+
+  nodeSel
+    .on('mouseover', (_, d) => {
+      if (d._cat === 'frontier') {
+        tooltip.style.opacity = 1;
+        tooltip.textContent = d.title;
+      }
+    })
+    .on('mousemove', event => {
+      const r = container.getBoundingClientRect();
+      tooltip.style.left = (event.clientX - r.left + 12) + 'px';
+      tooltip.style.top  = (event.clientY - r.top  - 8)  + 'px';
+    })
+    .on('mouseout', () => { tooltip.style.opacity = 0; })
+    .on('click', (event, d) => {
+      event.stopPropagation();
+      if (selected) d3.select(selected).classed('selected', false);
+      selected = event.currentTarget;
+      d3.select(selected).classed('selected', true);
+      tooltip.style.opacity = 0;
+      showDetail(d);
+    });
+
+  svg.on('click', () => {
+    if (selected) { d3.select(selected).classed('selected', false); selected = null; }
+    clearDetail();
+  });
+
+  // Toggles
+  function applyToggles() {
+    const showF = document.getElementById('tog-frontier').checked;
+    const showS = document.getElementById('tog-structural').checked;
+    const showI = document.getElementById('tog-inferred').checked;
+
+    nodeSel.style('display', d => d._cat === 'frontier' && !showF ? 'none' : null);
+
+    linkSel.style('display', d => {
+      if (d.edgeSource === 'wikipedia_links'  && !showS) return 'none';
+      if (d.edgeSource === 'ai_inference' && !showI) return 'none';
+      return null;
+    });
+  }
+
+  ['tog-frontier', 'tog-structural', 'tog-inferred'].forEach(id =>
+    document.getElementById(id).addEventListener('change', applyToggles)
+  );
+}
+
+// --- Node radius ---
+function radius(d) {
+  if (d._cat !== 'classified') return 4;
+  return 7 + (d.depth_score || 3) * 1.5;
+}
+
+// --- Drag ---
+function dragger(sim) {
+  return d3.drag()
+    .on('start', (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+    .on('drag',  (e, d) => { d.fx = e.x; d.fy = e.y; })
+    .on('end',   (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; });
+}
+
+// --- Detail panel ---
+function showDetail(d) {
+  const panel = document.getElementById('detail');
+  panel.classList.remove('empty');
+
+  if (d._cat === 'frontier') {
+    panel.innerHTML = `
+      <div class="d-title">${x(d.title)}</div>
+      <div class="d-badge" style="background:#111120;color:#404055;">frontier</div>
+      <div class="d-row"><span class="lbl">linked from</span><span class="val">${x(d.linked_from || '-')}</span></div>
+      <div style="margin-top:12px;font-size:9px;color:#252535;">Not yet classified.</div>
+    `;
+    return;
+  }
+
+  const col = DOMAIN_COLOR[d.primary_domain] || '#546e7a';
+
+  const tags = arr => arr && arr.length
+    ? `<div class="d-tags">${arr.map(t => `<span class="d-tag">${x(t)}</span>`).join('')}</div>` : '';
+
+  panel.innerHTML = `
+    <div class="d-title">${x(d.title)}</div>
+    <div class="d-badge" style="background:${col}18;color:${col};border:1px solid ${col}33;">
+      ${x(d.article_type || 'unknown')}
+    </div>
+
+    <div class="d-section">Scores</div>
+    ${sbar('depth', d.depth_score, col)}
+    ${sbar('weird', d.weird_factor, '#ce93d8')}
+    ${sbar('share', d.shareability_score, '#ffd700')}
+
+    <div class="d-section">Classification</div>
+    ${row('domain',     d.primary_domain)}
+    ${row('era',        d.era)}
+    ${row('geography',  d.primary_geography || '-')}
+    ${row('nav',        d.nav_style_signal)}
+    ${row('curriculum', d.curriculum_worthy ? 'yes' : 'no')}
+
+    ${d.curiosity_hook ? `<div class="d-hook">${x(d.curiosity_hook)}</div>` : ''}
+
+    ${d.key_figures && d.key_figures.length ? `
+      <div class="d-section">Key Figures</div>
+      ${tags(d.key_figures)}
+    ` : ''}
+
+    ${d.domains && d.domains.length > 1 ? `
+      <div class="d-section">Domains</div>
+      ${tags(d.domains)}
+    ` : ''}
+  `;
+}
+
+function clearDetail() {
+  const panel = document.getElementById('detail');
+  panel.classList.add('empty');
+  panel.innerHTML = '<div id="detail-placeholder">click a node<br>to inspect it</div>';
+}
+
+function sbar(label, val, color) {
+  const v = Math.max(0, Math.min(10, val || 0));
+  return `<div class="sbar">
+    <span class="lbl">${label}</span>
+    <div class="track"><div class="fill" style="width:${v * 10}%;background:${color};"></div></div>
+    <span class="num">${v}</span>
+  </div>`;
+}
+
+function row(label, value) {
+  return `<div class="d-row"><span class="lbl">${label}</span><span class="val">${x(String(value ?? '-'))}</span></div>`;
+}
+
+function x(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+</script>
+</body>
+</html>

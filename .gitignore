@@ -1,0 +1,7 @@
+.env
+graph.json
+curricula/
+last_response.txt
+__pycache__/
+*.pyc
+*.DS_Store
