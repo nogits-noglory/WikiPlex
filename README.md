@@ -1,6 +1,8 @@
 # WikiPlex
 
-A multiplayer knowledge game built on the full breadth of English Wikipedia. Each player starts from a random article and builds a personal knowledge map by following links. Together, all players build a living topological graph of human curiosity.
+WikiPlex is the next evolution of [WikiDactic](https://WikiDactic.com) - where WikiDactic turns Wikipedia articles into structured learning courses, WikiPlex takes it further by turning all of Wikipedia into a multiplayer knowledge game.
+
+Each player starts from a random article and builds a personal knowledge map by following links. Together, all players build a living topological graph of human curiosity.
 
 This repo is the local classification pipeline - the data engine that powers the map. It fetches Wikipedia articles, classifies them with an AI API, and writes results to `graph.json`.
 
