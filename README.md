@@ -6,6 +6,12 @@ Each player starts from a random article and builds a personal knowledge map by 
 
 This repo is the local classification pipeline - the data engine that powers the map. It fetches Wikipedia articles, classifies them with an AI API, and writes results to `graph.json`.
 
+## Screenshots
+
+![Graph view](screenshots/graph-1.png)
+![Graph view](screenshots/graph-2.png)
+![Graph view](screenshots/graph-3.png)
+
 ## Setup
 
 ```bash
