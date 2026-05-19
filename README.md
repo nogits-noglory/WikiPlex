@@ -1,6 +1,6 @@
 # WikiPlex
 
-WikiPlex is the next evolution of [WikiDactic](https://WikiDactic.com) - where WikiDactic turns Wikipedia articles into structured learning courses, WikiPlex takes it further by turning all of Wikipedia into a multiplayer knowledge game.
+WikiPlex is the next evolution of [WikiDactic](https://WikiDactic.com). WikiDactic turns Wikipedia articles into structured learning courses. WikiPlex takes that further by turning all of Wikipedia into a multiplayer knowledge game.
 
 Each player starts from a random article and builds a personal knowledge map by following links. Together, all players build a living topological graph of human curiosity.
 
