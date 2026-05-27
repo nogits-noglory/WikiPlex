@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="X-Content-Type-Options" content="nosniff">
+<title>WikiDactic — Leave Wikipedia Smarter</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css?v=18">
+</head>
+<body>
+
+<svg id="graph-svg" aria-hidden="true"></svg>
+
+<header id="hud">
+  <div id="hud-main">
+    <a class="hud-logo" href="/">Wiki<span>Dactic</span></a>
+    <div id="hud-search-wrap">
+      <span class="hud-search-icon">⌕</span>
+      <input type="text" id="topic-input"
+             placeholder="Search Wikipedia or the graph…"
+             autocomplete="off" spellcheck="false" maxlength="200">
+      <div id="ac-dropdown" class="ac-dropdown"></div>
+    </div>
+    <button id="btn-random" class="btn-random" title="Random article">⚄ RANDOM</button>
+    <div id="hud-meta">
+      <span id="hud-stats">
+        <strong id="stat-nodes">–</strong> nodes ·
+        <strong id="stat-edges">–</strong> edges
+      </span>
+      <span id="live-wrap">
+        <span id="live-dot" class="live-dot"></span>
+      </span>
+    </div>
+  </div>
+  <div id="input-error" class="error-inline hidden"></div>
+</header>
+
+<aside id="detail-panel">
+
+  <div id="panel-header">
+    <button id="btn-panel-back" title="Close panel">←</button>
+    <div id="panel-title-wrap">
+      <span id="panel-badge" class="panel-badge hidden"></span>
+      <span id="panel-title"></span>
+    </div>
+    <a id="wiki-link" href="#" target="_blank" rel="noopener noreferrer"
+       class="panel-wiki-btn hidden" title="Open on Wikipedia">↗</a>
+  </div>
+
+  <nav id="study-tabs" class="hidden" aria-label="Study sections">
+    <button class="stab active" data-panel="pretest">Pre-test</button>
+    <button class="stab" data-panel="curriculum">Study</button>
+    <button class="stab" data-panel="flashcards">Cards</button>
+    <button class="stab" data-panel="quiz">Quiz</button>
+    <button class="stab" data-panel="resources">More</button>
+  </nav>
+
+  <div id="panel-body">
+
+    <div id="pc-idle" class="pc">
+      <div class="pc-idle-inner">
+        <div class="idle-glyph">◈</div>
+        <div class="idle-tagline">Leave Wikipedia Smarter</div>
+        <p class="idle-mission">We're building the biggest ontological map of human knowledge ever.<br>Every search, every read, every quiz expands the graph for everyone.</p>
+        <p class="idle-hint">Click any node · search any topic · big things to come</p>
+        <div class="idle-legend">
+          <div class="idle-legend-title">Node States</div>
+          <div class="leg-row"><span class="leg-swatch untouched"></span><span>Untouched</span></div>
+          <div class="leg-row"><span class="leg-swatch viewed"></span><span>Viewed</span></div>
+          <div class="leg-row"><span class="leg-swatch studied"></span><span>Studied</span></div>
+          <div class="leg-row"><span class="leg-swatch conquered"></span><span>Conquered ★</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="pc-loading" class="pc hidden">
+      <div class="pc-loading-inner">
+        <div class="loading-ring"></div>
+        <div id="loading-msg" class="loading-msg">Fetching article…</div>
+        <div class="loading-steps">
+          <div class="loading-step" id="lstep-1">Fetching Wikipedia article…</div>
+          <div class="loading-step" id="lstep-2">Extracting key concepts…</div>
+          <div class="loading-step" id="lstep-3">Building curriculum…</div>
+          <div class="loading-step" id="lstep-4">Generating quiz tiers…</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="pc-article" class="pc hidden"></div>
+
+    <div id="pc-node" class="pc hidden"></div>
+
+    <div id="pc-study" class="pc hidden">
+      <section id="panel-pretest"    class="panel"></section>
+      <section id="panel-curriculum" class="panel hidden"></section>
+      <section id="panel-flashcards" class="panel hidden"></section>
+      <section id="panel-quiz"       class="panel hidden"></section>
+      <section id="panel-resources"  class="panel hidden"></section>
+    </div>
+
+  </div>
+</aside>
+
+<div id="edge-tooltip"></div>
+
+<div id="toast"></div>
+
+<button id="btn-help" class="btn-help" title="Field Guide — how to use WikiDactic">?</button>
+
+<div id="help-modal" class="help-modal hidden" role="dialog" aria-modal="true" aria-label="Field Guide">
+  <div class="help-backdrop" id="help-backdrop"></div>
+  <div class="help-box">
+    <div class="help-header">
+      <span class="help-header-title">// WikiDactic — Field Guide //</span>
+      <button id="help-close" class="help-close" title="Close">✕</button>
+    </div>
+    <p class="help-tagline">A <strong>living knowledge graph</strong> built from Wikipedia. Every article you explore becomes a node. Every link between articles becomes an edge. The more you learn, the bigger the map grows — and your progress is personal, tracked right here in your browser.</p>
+    <div class="help-content">
+      <div class="help-col">
+        <div class="help-col-title">◈ How to Navigate</div>
+        <div class="help-items">
+          <div class="help-item"><span class="help-item-key">CLICK NODE</span><span>Open the article panel — read the article, study a curriculum, take a quiz</span></div>
+          <div class="help-item"><span class="help-item-key">CLICK DOT</span><span><strong>Frontier nodes</strong> — small dim dots linked to known articles. Click to explore them</span></div>
+          <div class="help-item"><span class="help-item-key">SEARCH ⌕</span><span>Find any Wikipedia topic. Unclassified articles can be added to the graph</span></div>
+          <div class="help-item"><span class="help-item-key">RANDOM ⚄</span><span>Jump to a random classified article and discover something unexpected</span></div>
+          <div class="help-item"><span class="help-item-key">DRAG</span><span>Grab any node and reposition it. The layout is yours</span></div>
+          <div class="help-item"><span class="help-item-key">SCROLL</span><span>Zoom in and out. Pan by dragging the background</span></div>
+          <div class="help-item"><span class="help-item-key">HOVER EDGE</span><span>See the relationship type between two connected articles</span></div>
+        </div>
+        <div class="help-col-title" style="margin-top:20px">◈ Node States</div>
+        <div class="help-states">
+          <div class="hs-row"><span class="hs-dot untouched"></span><span>Untouched — never opened</span></div>
+          <div class="hs-row"><span class="hs-dot viewed"></span><span>Viewed — article panel opened</span></div>
+          <div class="hs-row"><span class="hs-dot studied"></span><span>Studied — completed the curriculum</span></div>
+          <div class="hs-row"><span class="hs-dot conquered"></span><span>Conquered — passed the quiz ★</span></div>
+        </div>
+      </div>
+      <div class="help-col">
+        <div class="help-col-title">◈ Knowledge Domains</div>
+        <div class="help-domains" id="help-domains">
+          
+        </div>
+      </div>
+    </div>
+    <div class="help-footer">
+      WikiDactic is open and growing — <span>25 articles</span> classified so far · <span>2892 connections</span> mapped
+    </div>
+  </div>
+</div>
+
+<script nonce="__CSP_NONCE__" src="js/d3.v7.min.js"></script>
+<script nonce="__CSP_NONCE__" src="js/purify.min.js"></script>
+<script nonce="__CSP_NONCE__" src="js/app.js?v=18"></script>
+</body>
+</html>

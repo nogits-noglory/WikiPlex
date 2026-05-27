@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-WikiFold - Local Classification Pipeline
+WikiFold - Classification Pipeline
 Usage:  python pipeline.py "French Revolution"
+        python pipeline.py --random
         python pipeline.py              (interactive)
 
-Requires: pip install anthropic requests python-dotenv
-Outputs:  graph.json + curricula/ directory
+Requires: pip install anthropic requests python-dotenv psycopg2-binary
+Outputs:  PostgreSQL (primary) + graph.json (local backup) + curricula/
 """
 
 import os
@@ -18,6 +19,14 @@ from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
+# Optional DB import — pipeline works without it (writes graph.json only)
+try:
+    import psycopg2
+    from psycopg2.extras import Json as PgJson
+    PG_AVAILABLE = True
+except ImportError:
+    PG_AVAILABLE = False
+
 # --- Setup ---
 BASE_DIR       = Path(__file__).parent
 GRAPH_PATH     = BASE_DIR / "graph.json"
@@ -25,6 +34,129 @@ CURRICULA_DIR  = BASE_DIR / "curricula"
 LAST_RESP_PATH = BASE_DIR / "last_response.txt"
 
 load_dotenv(BASE_DIR / ".env")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/wikifold")
+
+# --- DB helpers ---
+def get_db_conn():
+    if not PG_AVAILABLE:
+        return None
+    try:
+        return psycopg2.connect(DATABASE_URL)
+    except Exception as e:
+        warn(f"DB connection failed: {e}. Writing graph.json only.")
+        return None
+
+def db_write_node(conn, node: dict):
+    """Upsert a classified node into Postgres."""
+    if conn is None:
+        return
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO nodes (
+            id, title, classified, article_type,
+            depth_score, shareability_score, weird_factor,
+            curriculum_worthy, curiosity_hook,
+            primary_domain, domains, era, primary_geography,
+            geography, key_figures, linguistic_root,
+            related_concepts, disambiguation_risks,
+            nav_style_signal, gap_assessment, classified_at, visit_count
+        ) VALUES (
+            %s,%s,%s,%s, %s,%s,%s, %s,%s, %s,%s,%s,%s,
+            %s,%s,%s, %s,%s, %s,%s,%s, 1
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            title               = EXCLUDED.title,
+            classified          = EXCLUDED.classified,
+            article_type        = EXCLUDED.article_type,
+            depth_score         = EXCLUDED.depth_score,
+            shareability_score  = EXCLUDED.shareability_score,
+            weird_factor        = EXCLUDED.weird_factor,
+            curriculum_worthy   = EXCLUDED.curriculum_worthy,
+            curiosity_hook      = EXCLUDED.curiosity_hook,
+            primary_domain      = EXCLUDED.primary_domain,
+            domains             = EXCLUDED.domains,
+            era                 = EXCLUDED.era,
+            primary_geography   = EXCLUDED.primary_geography,
+            geography           = EXCLUDED.geography,
+            key_figures         = EXCLUDED.key_figures,
+            linguistic_root     = EXCLUDED.linguistic_root,
+            related_concepts    = EXCLUDED.related_concepts,
+            disambiguation_risks= EXCLUDED.disambiguation_risks,
+            nav_style_signal    = EXCLUDED.nav_style_signal,
+            gap_assessment      = EXCLUDED.gap_assessment,
+            classified_at       = EXCLUDED.classified_at,
+            visit_count         = nodes.visit_count + 1
+    """, (
+        node["id"], node["title"], True, node.get("article_type"),
+        node.get("depth_score"), node.get("shareability_score"), node.get("weird_factor"),
+        node.get("curriculum_worthy"), node.get("curiosity_hook"),
+        node.get("primary_domain"),
+        PgJson(node["domains"]) if node.get("domains") else None,
+        node.get("era"), node.get("primary_geography"),
+        PgJson(node["geography"]) if node.get("geography") else None,
+        PgJson(node["key_figures"]) if node.get("key_figures") else None,
+        node.get("linguistic_root"),
+        PgJson(node["related_concepts"]) if node.get("related_concepts") else None,
+        PgJson(node["disambiguation_risks"]) if node.get("disambiguation_risks") else None,
+        node.get("nav_style_signal"), node.get("gap_assessment"),
+        node.get("visited_at"),
+    ))
+    # Remove from frontier if it was there
+    cur.execute("DELETE FROM frontier WHERE id = %s", (node["id"],))
+    cur.close()
+
+def db_write_edges(conn, edges: list):
+    if conn is None:
+        return
+    cur = conn.cursor()
+    for e in edges:
+        cur.execute("""
+            INSERT INTO edges (from_node, to_node, edge_type, predicate, weight, edge_source, source_sentence, created_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (from_node, to_node, edge_type, predicate) DO NOTHING
+        """, (
+            e["from"], e["to"], e.get("type","structural"),
+            e.get("predicate","links to"), e.get("weight",1.0),
+            e.get("source","wikipedia_links"), e.get("source_sentence"),
+            e.get("created_at"),
+        ))
+    cur.close()
+
+def db_write_frontier(conn, frontier_updates: list):
+    if conn is None:
+        return
+    cur = conn.cursor()
+    for f in frontier_updates:
+        cur.execute("""
+            INSERT INTO frontier (id, title, linked_from)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (id) DO NOTHING
+        """, (f["id"], f.get("title", f["id"]), f.get("linked_from")))
+    cur.close()
+
+def db_write_curriculum(conn, node_id: str, curriculum_data: dict):
+    if conn is None:
+        return
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO curricula (node_id, data, generated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (node_id) DO UPDATE SET
+            data         = EXCLUDED.data,
+            generated_at = NOW()
+    """, (node_id, PgJson(curriculum_data)))
+    cur.close()
+
+def db_emit_event(conn, event_type: str, node_id: str, payload: dict):
+    if conn is None:
+        return
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO graph_events (event_type, node_id, payload)
+        VALUES (%s, %s, %s)
+    """, (event_type, node_id, PgJson(payload)))
+    cur.close()
 
 API_KEY = os.getenv("ANTHROPIC_API_KEY")
 MODEL   = os.getenv("MODEL", "claude-sonnet-4-20250514")
@@ -450,12 +582,24 @@ def run(input_title: str):
     pre = preclassify(wiki["title"], wiki["text"], wiki["word_count"])
     if pre["is_disambiguation"]:
         warn(f'"{wiki["title"]}" is a disambiguation page. Writing stub node.')
-        graph["nodes"][wiki["title"]] = {
+        stub_node = {
             "id": wiki["title"], "title": wiki["title"], "classified": True,
             "article_type": "stub", "curriculum_worthy": False,
             "visited_at": datetime.now(timezone.utc).isoformat(),
         }
+        graph["nodes"][wiki["title"]] = stub_node
         save_graph(graph)
+        conn = get_db_conn()
+        if conn:
+            try:
+                db_write_node(conn, stub_node)
+                conn.commit()
+                ok("Stub node written to PostgreSQL")
+            except Exception as e:
+                err(f"PostgreSQL write failed: {e}")
+                conn.rollback()
+            finally:
+                conn.close()
         return
     if pre["is_stub"]:
         warn(f'"{wiki["title"]}" appears to be a stub ({wiki["word_count"]} words). Classifying anyway.')
@@ -531,6 +675,27 @@ def run(input_title: str):
 
     save_graph(graph)
     ok("Graph saved to graph.json")
+
+    # Step 8b: Persist to PostgreSQL
+    conn = get_db_conn()
+    if conn:
+        try:
+            db_write_node(conn, node)
+            db_write_edges(conn, all_edges)
+            db_write_frontier(conn, frontier_updates)
+            db_write_curriculum(conn, wiki["title"], parsed["curriculum"])
+            db_emit_event(conn, "node_classified", wiki["title"], {
+                "node":           node,
+                "edge_count":     len(all_edges),
+                "inferred_count": len(inferred_edges),
+            })
+            conn.commit()
+            ok("Written to PostgreSQL")
+        except Exception as e:
+            err(f"PostgreSQL write failed: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
 
     # Step 9: Display
     print_node(node)
