@@ -283,21 +283,6 @@ app.get('/api/search', async (req, res) => {
  * ─────────────────────────────────────────────────────────────────── */
 app.get('/api/random', async (_req, res) => {
   try {
-    // Prefer nodes with higher depth_score to seed interesting exploration
-    const result = await pool.query(
-      `SELECT id, title, article_type, primary_domain, depth_score,
-              weird_factor, curiosity_hook, era, primary_geography
-       FROM nodes
-       WHERE classified = true
-       ORDER BY random() * COALESCE(depth_score, 5) DESC
-       LIMIT 1`
-    );
-
-    if (result.rowCount > 0) {
-      return res.json({ source: 'graph', node: result.rows[0] });
-    }
-
-    // Fallback: Wikipedia random article
     const wikiRes = await fetch(
       'https://en.wikipedia.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=1&format=json&origin=*',
       { headers: { 'User-Agent': 'WikiFold/0.1 (learning graph project)' }, signal: AbortSignal.timeout(10_000) }
@@ -354,8 +339,8 @@ app.post('/api/generate', rateLimit, async (req, res) => {
 
   const safeMaxTokens = Math.min(Math.max(parseInt(maxTokens, 10) || 7000, 100), 8000);
 
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
+  if (!process.env.LLM_API_KEY) {
+    return res.status(500).json({ error: 'LLM_API_KEY not configured on server' });
   }
 
   const controller = new AbortController();
@@ -367,8 +352,8 @@ app.post('/api/generate', rateLimit, async (req, res) => {
       signal:  controller.signal,
       headers: {
         'Content-Type':      'application/json',
-        'x-api-key':         process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
+        'x-api-key':         process.env.LLM_API_KEY,
+        'llm-version': '2023-06-01',
       },
       body: JSON.stringify({
         model:      process.env.MODEL || 'claude-sonnet-4-20250514',
@@ -381,7 +366,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     clearTimeout(timeout);
     const data = await upstream.json();
     if (!upstream.ok) {
-      return res.status(upstream.status).json({ error: data.error?.message || 'Anthropic error' });
+      return res.status(upstream.status).json({ error: data.error?.message || 'API error' });
     }
     res.json(data);
 
@@ -390,6 +375,29 @@ app.post('/api/generate', rateLimit, async (req, res) => {
     if (err.name === 'AbortError') return res.status(504).json({ error: 'Upstream request timed out' });
     console.error('Proxy error:', err.message);
     res.status(502).json({ error: 'Upstream request failed' });
+  }
+});
+
+/* ── POST /api/classify ──────────────────────────────────────────── *
+ * Queues a Wikipedia article for classification into the graph.
+ * ─────────────────────────────────────────────────────────────────── */
+app.post('/api/classify', rateLimit, async (req, res) => {
+  const { title } = req.body;
+  if (!title || typeof title !== 'string' || title.trim().length < 1) {
+    return res.status(400).json({ error: 'Missing or invalid title' });
+  }
+  const clean = title.trim().slice(0, 300);
+  try {
+    await pool.query(
+      `INSERT INTO frontier (id, title, discovered_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (id) DO NOTHING`,
+      [clean, clean]
+    );
+    return res.status(202).json({ queued: true, title: clean });
+  } catch (err) {
+    console.error('/api/classify error:', err.message);
+    return res.status(500).json({ error: 'Could not queue article' });
   }
 });
 

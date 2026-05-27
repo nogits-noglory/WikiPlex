@@ -5,7 +5,7 @@ Usage:  python pipeline.py "French Revolution"
         python pipeline.py --random
         python pipeline.py              (interactive)
 
-Requires: pip install anthropic requests python-dotenv psycopg2-binary
+Requires: pip install requests requests python-dotenv psycopg2-binary
 Outputs:  PostgreSQL (primary) + graph.json (local backup) + curricula/
 """
 
@@ -158,11 +158,11 @@ def db_emit_event(conn, event_type: str, node_id: str, payload: dict):
     """, (event_type, node_id, PgJson(payload)))
     cur.close()
 
-API_KEY = os.getenv("ANTHROPIC_API_KEY")
+API_KEY = os.getenv("LLM_API_KEY")
 MODEL   = os.getenv("MODEL", "claude-sonnet-4-20250514")
 
 if not API_KEY:
-    print("\n  ERROR: ANTHROPIC_API_KEY not found in .env\n")
+    print("\n  ERROR: LLM_API_KEY not found in .env\n")
     sys.exit(1)
 
 # --- Colors ---
@@ -392,7 +392,7 @@ def call_api(system: str, user: str) -> str:
         "https://api.anthropic.com/v1/messages",
         headers={
             "x-api-key":         API_KEY,
-            "anthropic-version": "2023-06-01",
+            "llm-version": "2023-06-01",
             "content-type":      "application/json",
         },
         json={
@@ -405,7 +405,7 @@ def call_api(system: str, user: str) -> str:
     )
     if not resp.ok:
         data = resp.json()
-        raise RuntimeError(f"Anthropic API {resp.status_code}: {data.get('error', {}).get('message', 'unknown')}")
+        raise RuntimeError(f"LLM API {resp.status_code}: {data.get('error', {}).get('message', 'unknown')}")
     return resp.json()["content"][0]["text"]
 
 # --- Parser ---

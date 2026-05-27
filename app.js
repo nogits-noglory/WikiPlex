@@ -166,7 +166,9 @@ let selectedNodeId = null;
 const zoomBehavior = d3.zoom()
   .scaleExtent([0.05, 12])
   .filter(event => {
-    if (event.type === 'mousedown') return !event.target.closest('.node');
+    if (event.type === 'mousedown' || event.type === 'pointerdown') {
+      return !event.target.closest('.node');
+    }
     return !event.ctrlKey && !event.button;
   })
   .on('zoom', e => zoomRoot.attr('transform', e.transform));
@@ -793,7 +795,7 @@ async function showArticleForTitle(title) {
     <div class="art-full-text hidden" id="art-full-text">${esc(rest)}</div>` : ''}
     <div class="art-ctas">
       <button class="btn-cta-primary" id="btn-study-it">STUDY THIS ARTICLE →</button>
-      <button class="btn-cta-secondary" id="btn-graph-it">Add to graph only</button>
+      <button class="btn-cta-secondary" id="btn-graph-it">Classify for Map</button>
     </div>
     <hr class="art-sep">
     <div class="art-meta">
@@ -829,12 +831,11 @@ async function showArticleForTitle(title) {
       });
       const data = await r.json();
       if (r.ok) {
-        showToast(`+ ${wiki.title} added to graph`);
-        closePanel();
-        
+        showToast(`${wiki.title} queued for the map`);
+        btn.textContent = 'Queued';
       } else {
         btn.disabled = false;
-        btn.textContent = 'Add to graph only';
+        btn.textContent = 'Classify for Map';
         showToast(data.error || 'Classification failed', 4000);
       }
     } catch(e) {
@@ -1153,7 +1154,7 @@ async function fetchWikipedia(topic) {
   };
 }
 
-async function callClaude(user, maxTokens=7000) {
+async function callLLM(user, maxTokens=7000) {
   const r = await fetch(PROXY_API, {
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({user, maxTokens}),
@@ -1186,7 +1187,7 @@ Return EXACTLY this JSON (no markdown, no extra text):
 }
 RULES: dictionary 8-14 entries. people 4-8. timeline 6-12. flashcards exactly 16. pretest exactly 5. quiz exactly 20 questions easy→hard. All questions: 4 options, correctIndex 0-based. Real URLs only.`;
 
-  const raw = await callClaude(usr, 7000);
+  const raw = await callLLM(usr, 7000);
   const cleaned = raw.replace(/^```json\s*/i,'').replace(/^```\s*/i,'').replace(/```\s*$/,'').trim();
   return JSON.parse(cleaned);
 }
@@ -1262,13 +1263,9 @@ async function handleRandom() {
   try {
     const r = await fetch('/api/random');
     const d = await r.json();
-    if (d.source === 'graph' && d.node) {
-      focusNode(d.node.id);
-      selectNode(d.node.id);
-      showNodePanel(d.node);
-    } else {
-      await showArticleForTitle(d.title || 'Random article');
-    }
+    const title = d.title || (d.node && (d.node.title || d.node.id));
+    if (!title) { showToast('Could not fetch random article', 3000); return; }
+    await showArticleForTitle(title);
   } catch(e) {
     showToast('Could not fetch random article', 3000);
   }

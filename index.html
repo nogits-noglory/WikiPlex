@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
-<title>WikiDactic — Leave Wikipedia Smarter</title>
+<title>WikiDactic: Leave Wikipedia Smarter</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="css/style.css?v=18">
+<link rel="stylesheet" href="css/style.css?v=19">
 </head>
 <body>
 
@@ -107,51 +107,67 @@
 
 <div id="toast"></div>
 
-<button id="btn-help" class="btn-help" title="Field Guide — how to use WikiDactic">?</button>
+<div class="kadin-credit">
+  <span class="kadin-credit-label">A Kadin Chaira Joint</span>
+  <div class="kadin-credit-links">
+    <a href="https://www.linkedin.com/in/kadin-chaira-20586a1aa/" target="_blank" rel="noopener noreferrer" title="LinkedIn">
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="#0a66c2" aria-label="LinkedIn">
+        <path d="M20.447 20.452h-3.554v-5.569c0-1.328-.027-3.037-1.852-3.037-1.853 0-2.136 1.445-2.136 2.939v5.667H9.351V9h3.414v1.561h.046c.477-.9 1.637-1.85 3.37-1.85 3.601 0 4.267 2.37 4.267 5.455v6.286zM5.337 7.433c-1.144 0-2.063-.926-2.063-2.065 0-1.138.92-2.063 2.063-2.063 1.14 0 2.064.925 2.064 2.063 0 1.139-.925 2.065-2.064 2.065zm1.782 13.019H3.555V9h3.564v11.452zM22.225 0H1.771C.792 0 0 .774 0 1.729v20.542C0 23.227.792 24 1.771 24h20.451C23.2 24 24 23.227 24 22.271V1.729C24 .774 23.2 0 22.222 0h.003z"/>
+      </svg>
+    </a>
+    <a href="https://github.com/nogits-noglory" target="_blank" rel="noopener noreferrer" title="GitHub">
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="#1a3a5c" aria-label="GitHub">
+        <path d="M12 0C5.374 0 0 5.373 0 12c0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23A11.509 11.509 0 0112 5.803c1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576C20.566 21.797 24 17.3 24 12c0-6.627-5.373-12-12-12z"/>
+      </svg>
+    </a>
+  </div>
+</div>
+
+<button id="btn-help" class="btn-help" title="Field Guide: how to use WikiDactic">?</button>
 
 <div id="help-modal" class="help-modal hidden" role="dialog" aria-modal="true" aria-label="Field Guide">
   <div class="help-backdrop" id="help-backdrop"></div>
   <div class="help-box">
     <div class="help-header">
-      <span class="help-header-title">// WikiDactic — Field Guide //</span>
+      <span class="help-header-title">// WikiDactic: Field Guide //</span>
       <button id="help-close" class="help-close" title="Close">✕</button>
     </div>
-    <p class="help-tagline">A <strong>living knowledge graph</strong> built from Wikipedia. Every article you explore becomes a node. Every link between articles becomes an edge. The more you learn, the bigger the map grows — and your progress is personal, tracked right here in your browser.</p>
+    <p class="help-tagline">A <strong>living knowledge graph</strong> built from Wikipedia. Every article you explore becomes a node. Every link between articles becomes an edge. The more you learn, the bigger the map grows. Your progress is personal, tracked right here in your browser.</p>
     <div class="help-content">
       <div class="help-col">
         <div class="help-col-title">◈ How to Navigate</div>
         <div class="help-items">
-          <div class="help-item"><span class="help-item-key">CLICK NODE</span><span>Open the article panel — read the article, study a curriculum, take a quiz</span></div>
-          <div class="help-item"><span class="help-item-key">CLICK DOT</span><span><strong>Frontier nodes</strong> — small dim dots linked to known articles. Click to explore them</span></div>
+          <div class="help-item"><span class="help-item-key">CLICK NODE</span><span>Open the article panel: read the article, study a curriculum, take a quiz</span></div>
+          <div class="help-item"><span class="help-item-key">CLICK DOT</span><span><strong>Frontier nodes</strong>: small dim dots linked to known articles. Click to explore them</span></div>
           <div class="help-item"><span class="help-item-key">SEARCH ⌕</span><span>Find any Wikipedia topic. Unclassified articles can be added to the graph</span></div>
-          <div class="help-item"><span class="help-item-key">RANDOM ⚄</span><span>Jump to a random classified article and discover something unexpected</span></div>
+          <div class="help-item"><span class="help-item-key">RANDOM ⚄</span><span>Pull a completely random Wikipedia article and read it</span></div>
           <div class="help-item"><span class="help-item-key">DRAG</span><span>Grab any node and reposition it. The layout is yours</span></div>
           <div class="help-item"><span class="help-item-key">SCROLL</span><span>Zoom in and out. Pan by dragging the background</span></div>
           <div class="help-item"><span class="help-item-key">HOVER EDGE</span><span>See the relationship type between two connected articles</span></div>
         </div>
         <div class="help-col-title" style="margin-top:20px">◈ Node States</div>
         <div class="help-states">
-          <div class="hs-row"><span class="hs-dot untouched"></span><span>Untouched — never opened</span></div>
-          <div class="hs-row"><span class="hs-dot viewed"></span><span>Viewed — article panel opened</span></div>
-          <div class="hs-row"><span class="hs-dot studied"></span><span>Studied — completed the curriculum</span></div>
-          <div class="hs-row"><span class="hs-dot conquered"></span><span>Conquered — passed the quiz ★</span></div>
+          <div class="hs-row"><span class="hs-dot untouched"></span><span>Untouched: never opened</span></div>
+          <div class="hs-row"><span class="hs-dot viewed"></span><span>Viewed: article panel opened</span></div>
+          <div class="hs-row"><span class="hs-dot studied"></span><span>Studied: completed the curriculum</span></div>
+          <div class="hs-row"><span class="hs-dot conquered"></span><span>Conquered: passed the quiz ★</span></div>
         </div>
       </div>
       <div class="help-col">
         <div class="help-col-title">◈ Knowledge Domains</div>
         <div class="help-domains" id="help-domains">
-          
+
         </div>
       </div>
     </div>
     <div class="help-footer">
-      WikiDactic is open and growing — <span>25 articles</span> classified so far · <span>2892 connections</span> mapped
+      WikiDactic is open and growing. <span>25 articles</span> classified so far · <span>2892 connections</span> mapped
     </div>
   </div>
 </div>
 
 <script nonce="__CSP_NONCE__" src="js/d3.v7.min.js"></script>
 <script nonce="__CSP_NONCE__" src="js/purify.min.js"></script>
-<script nonce="__CSP_NONCE__" src="js/app.js?v=18"></script>
+<script nonce="__CSP_NONCE__" src="js/app.js?v=19"></script>
 </body>
 </html>

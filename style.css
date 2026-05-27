@@ -70,9 +70,11 @@ body {
   background: radial-gradient(ellipse 120% 120% at 50% 30%, #ffffff 0%, #e8f4ff 35%, #cce0f8 70%, #b8d0ee 100%);
   cursor: grab;
   z-index: 0;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
-.node { cursor: pointer; }
+.node { cursor: pointer; touch-action: none; }
 #graph-svg:active { cursor: grabbing; }
 
 .node { cursor: pointer; }
@@ -1354,5 +1356,46 @@ body {
   color: var(--muted);
   text-align: center;
   letter-spacing: 0.06em;
+}
+
+.kadin-credit {
+  position: fixed;
+  bottom: 14px;
+  left: 16px;
+  z-index: 150;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  text-transform: uppercase;
+  opacity: 0.72;
+  pointer-events: auto;
+}
+.kadin-credit:hover { opacity: 1; }
+.kadin-credit-label {
+  white-space: nowrap;
+  color: var(--muted2);
+}
+.kadin-credit-links {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.kadin-credit-links a {
+  display: flex;
+  align-items: center;
+  opacity: 0.7;
+  transition: opacity 0.15s, transform 0.15s;
+  color: inherit;
+}
+.kadin-credit-links a:hover {
+  opacity: 1;
+  transform: scale(1.15);
+}
+@media (max-width: 768px) {
+  .kadin-credit { bottom: 90px; left: 12px; font-size: 9px; }
 }
 .help-footer span { color: var(--accent3); }
