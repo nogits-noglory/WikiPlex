@@ -389,7 +389,7 @@ app.post('/api/classify', rateLimit, async (req, res) => {
   const clean = title.trim().slice(0, 300);
   try {
     await pool.query(
-      `INSERT INTO frontier (id, title, discovered_at)
+      `INSERT INTO frontier (id, title, added_at)
        VALUES ($1, $2, NOW())
        ON CONFLICT (id) DO NOTHING`,
       [clean, clean]
