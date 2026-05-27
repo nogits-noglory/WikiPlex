@@ -91,8 +91,8 @@ body {
   animation: conquest-pulse 2.4s ease-in-out infinite;
 }
 
-.node.selected .node-glow { opacity: 0.55 !important; }
-.node.selected .node-main  { stroke: var(--text2); stroke-width: 1.5; }
+.node.selected .node-glow { opacity: 0.6 !important; }
+.node.selected .node-main  { stroke: #ffffff; stroke-width: 2.5; }
 
 .edge-visual { transition: stroke-opacity 0.12s, stroke-width 0.12s; }
 .edge-visual.hovered  { stroke-opacity: 1 !important; stroke-width: 2.5px !important; }

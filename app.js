@@ -387,11 +387,11 @@ function renderGraph() {
         // Main circle
         g.append('circle').attr('class','node-main')
           .attr('fill', d => domainColor(d.primary_domain))
-          .attr('stroke','rgba(255,255,255,0.9)').attr('stroke-width',2);
+          .attr('stroke','rgba(255,255,255,0.6)').attr('stroke-width',1.5);
 
         // Center dot
         g.append('circle').attr('class','node-core')
-          .attr('r',2.2).attr('fill','rgba(255,255,255,0.7)');
+          .attr('r',2.2).attr('fill','rgba(255,255,255,0.85)');
 
         // Label
         g.append('text').attr('class','node-label')
@@ -428,12 +428,12 @@ function renderGraph() {
 
     // Ghost (frontier) nodes — visible dim dots, clickable
     if (d.ghost) {
-      g.select('.node-main').attr('r', 4).attr('fill', '#88bbee').attr('opacity', 0.45);
-      g.select('.node-glow').attr('r', 7).attr('fill', '#4499dd').attr('opacity', 0.12);
+      g.select('.node-main').attr('r', 5).attr('fill', '#3366aa').attr('opacity', 0.7);
+      g.select('.node-glow').attr('r', 9).attr('fill', '#2255aa').attr('opacity', 0.22);
       g.select('.node-ring').attr('r', 0).attr('stroke', 'none');
       g.select('.node-conquest-ring').attr('opacity', 0);
       g.select('.node-core').attr('r', 0);
-      g.select('.node-label').attr('fill', '#445566').attr('dy', 17)
+      g.select('.node-label').attr('fill', '#2a4a7a').attr('dy', 18)
         .text(truncLabel(d.title));
       return;
     }
@@ -446,12 +446,12 @@ function renderGraph() {
     g.select('.node-glow').attr('r', r + 8);
     g.select('.node-main').attr('r', r)
       .attr('fill', domainColor(d.primary_domain))
-      .attr('opacity', ps === PS.UNTOUCHED ? 0.35 : 1);
+      .attr('opacity', ps === PS.UNTOUCHED ? 0.82 : 1);
     g.select('.node-glow').attr('fill', domainColor(d.primary_domain))
-      .attr('opacity', ps === PS.UNTOUCHED ? 0.08 : 0.28);
+      .attr('opacity', ps === PS.UNTOUCHED ? 0.18 : 0.38);
     g.select('.node-label')
       .attr('dy', r + 15)
-      .attr('fill', ps === PS.UNTOUCHED ? '#8aabcc' : '#1a3a5c')
+      .attr('fill', ps === PS.UNTOUCHED ? '#3a5a7a' : '#0d2030')
       .text(truncLabel(d.title));
 
     applyStateRing(g, ps, d);
