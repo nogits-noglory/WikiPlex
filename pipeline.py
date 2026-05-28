@@ -308,6 +308,26 @@ def save_graph(graph: dict):
     GRAPH_PATH.write_text(json.dumps(graph, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # --- Wikipedia ---
+def verify_wiki_title(title: str):
+    """Check if a Wikipedia article exists. Returns canonical title string or None."""
+    base = "https://en.wikipedia.org/w/api.php"
+    params = {
+        "action": "query", "titles": title,
+        "redirects": 1, "format": "json", "origin": "*"
+    }
+    try:
+        resp = requests.get(base, params=params,
+                            headers={"User-Agent": "WikiFold/0.1 (learning graph project)"},
+                            timeout=8)
+        resp.raise_for_status()
+        pages = resp.json().get("query", {}).get("pages", {})
+        for pid, page in pages.items():
+            if pid == "-1" or "missing" in page:
+                return None
+            return page.get("title", title)
+    except Exception:
+        return None
+
 def fetch_wikipedia(title: str) -> dict:
     base = "https://en.wikipedia.org/w/api.php"
     params_text = {
@@ -469,7 +489,8 @@ RULES FOR classification:
 
 RULES FOR triples:
 - Extract 8 to 20 triples. Every triple must include source_sentence copied exactly from the text.
-- object_is_link must be true only if the object appears in the outbound links list above.
+- object_wiki_title should be the exact Wikipedia article title for the object entity. Set it for ANY entity that plausibly has a Wikipedia article -- you are NOT limited to the outbound links list above. The outbound links are a hint, not a ceiling.
+- object_is_link should be true whenever you set object_wiki_title. Set it false only for abstract concepts that have no Wikipedia article (e.g. "the idea of justice", "an unnamed ancestor").
 - Never emit a triple where subject and object are the same article.
 - AIM TO USE EVERY EDGE TYPE FAMILY. Push yourself to find temporal, implication, analogy, influence, and application edges, not just categorical and geographical ones.
 - Use ONLY these predicates:
@@ -655,24 +676,38 @@ def extract_graph_updates(title: str, parsed: dict, outbound_links: list) -> tup
         for link in outbound_links if link != title
     ]
 
-    inferred_edges = [
-        {
+    # Build typed edges from LLM triples.
+    # Triple targets may be any Wikipedia article -- not limited to outbound links.
+    # For targets already in outbound_links we trust them directly.
+    # For novel targets we verify existence via the Wikipedia API before creating the edge.
+    outbound_set = set(outbound_links)
+    inferred_edges = []
+    for t in triples:
+        raw_target = t.get("object_wiki_title")
+        if not raw_target or not t.get("object_is_link"):
+            continue
+        raw_target = raw_target.strip()
+        if raw_target == title:
+            continue
+        if raw_target in outbound_set:
+            canonical = raw_target
+        else:
+            # Verify the article exists on Wikipedia; get canonical title
+            canonical = verify_wiki_title(raw_target)
+            if not canonical:
+                continue
+        inferred_edges.append({
             "from":            title,
-            "to":              t["object_wiki_title"],
-            "type":            t["edge_type"],
-            "predicate":       t["predicate"],
+            "to":              canonical,
+            "type":            t.get("edge_type", "categorical"),
+            "predicate":       t.get("predicate", "related to"),
             "weight":          0.8,
             "source":          "ai_inference",
-            "source_sentence": t["source_sentence"],
+            "source_sentence": t.get("source_sentence", ""),
             "created_at":      now,
-        }
-        for t in triples
-        if t.get("object_is_link") and t.get("object_wiki_title")
-    ]
+        })
 
-    # Only queue articles the LLM identified as meaningful relationships —
-    # not every outbound link. Classifying one article could have 500+ outbound
-    # links and most would be stubs, redirects, or disambiguation pages.
+    # Queue all typed-edge targets as frontier nodes (they are meaningful relationships)
     inferred_targets = {e["to"] for e in inferred_edges}
     frontier_updates = [
         {"id": link, "title": link, "classified": False, "linked_from": title}

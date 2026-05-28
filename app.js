@@ -303,11 +303,13 @@ function makeSimulation() {
       })
     )
     .force('charge', d3.forceManyBody()
-      .strength(d => d.ghost ? -120 : -(320 + (d.depth_score || 3) * 32))
+      .strength(d => d.ghost
+        ? (d.typed_ghost ? -60 : -80)       // typed ghosts cluster near parent; structural ghosts push further
+        : -(320 + (d.depth_score || 3) * 32))
       .distanceMax(600)
     )
     .force('collide', d3.forceCollide()
-      .radius(d => (d.ghost ? 12 : nodeRadius(d)) + 28)
+      .radius(d => (d.ghost ? (d.typed_ghost ? 14 : 10) : nodeRadius(d)) + 24)
       .iterations(3)
     )
     .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.05))
@@ -356,33 +358,54 @@ async function loadGraph() {
     nodeIds.has(e.from) && nodeIds.has(e.to) && e.source !== 'wikipedia_links'
   );
 
-  // ── Ghost (frontier) nodes: top-45 most-referenced unclassified neighbors
-  //    with at least 2 references — reduces peripheral clutter.
-  const neighborCount = new Map();
-  allEdges.forEach(e => {
-    if (nodeIds.has(e.from) && !nodeIds.has(e.to))
-      neighborCount.set(e.to, (neighborCount.get(e.to)||0)+1);
-    if (nodeIds.has(e.to) && !nodeIds.has(e.from))
-      neighborCount.set(e.from, (neighborCount.get(e.from)||0)+1);
-  });
-  const ghostIds = [...neighborCount.entries()]
-    .filter(([, count]) => count >= 2)     // must be referenced by 2+ classified nodes
-    .sort((a,b) => b[1]-a[1])
-    .slice(0, 45)
-    .map(([id]) => id);
-  const ghostIdSet = new Set(ghostIds);
+  // ── Ghost (frontier) nodes — two tiers:
+  //
+  //  Tier 1: TYPED ghosts — any unclassified node connected to a classified node
+  //          via a rich typed edge (interpersonal, geographical, etc.).
+  //          Show ALL of them (up to 80); show every typed edge.
+  //          These are exactly the relationships the classifier identified.
+  //
+  //  Tier 2: STRUCTURAL ghosts — unclassified nodes referenced 2+ times via
+  //          raw Wikipedia link edges (not already in tier 1).
+  //          Top 30 by reference count; one structural edge each.
 
-  // One structural edge per ghost node — the highest-weight one connecting it to a classified node
-  const ghostBestEdge = new Map();
+  // Tier 1: all typed edges pointing to unclassified nodes
+  const typedGhostEdges = allEdges.filter(e =>
+    nodeIds.has(e.from) && !nodeIds.has(e.to) && e.source !== 'wikipedia_links'
+  );
+  const typedGhostIds = new Set(typedGhostEdges.map(e => e.to));
+
+  // Tier 2: structural-only unclassified neighbors (skip tier-1 nodes)
+  const structNeighborCount = new Map();
   allEdges.forEach(e => {
-    const fromGhost = ghostIdSet.has(e.from) && nodeIds.has(e.to);
-    const toGhost   = ghostIdSet.has(e.to)   && nodeIds.has(e.from);
+    if (e.source !== 'wikipedia_links') return;
+    if (nodeIds.has(e.from) && !nodeIds.has(e.to) && !typedGhostIds.has(e.to))
+      structNeighborCount.set(e.to, (structNeighborCount.get(e.to)||0)+1);
+    if (nodeIds.has(e.to) && !nodeIds.has(e.from) && !typedGhostIds.has(e.from))
+      structNeighborCount.set(e.from, (structNeighborCount.get(e.from)||0)+1);
+  });
+  const structGhostIds = [...structNeighborCount.entries()]
+    .filter(([, count]) => count >= 2)
+    .sort((a,b) => b[1]-a[1])
+    .slice(0, 30)
+    .map(([id]) => id);
+  const structGhostIdSet = new Set(structGhostIds);
+
+  // One structural edge per tier-2 ghost (highest-weight connection)
+  const structGhostBestEdge = new Map();
+  allEdges.forEach(e => {
+    if (e.source !== 'wikipedia_links') return;
+    const fromGhost = structGhostIdSet.has(e.from) && nodeIds.has(e.to);
+    const toGhost   = structGhostIdSet.has(e.to)   && nodeIds.has(e.from);
     if (!fromGhost && !toGhost) return;
     const ghostId = fromGhost ? e.from : e.to;
-    const prev = ghostBestEdge.get(ghostId);
-    if (!prev || (e.weight || 0) > (prev.weight || 0)) ghostBestEdge.set(ghostId, e);
+    const prev = structGhostBestEdge.get(ghostId);
+    if (!prev || (e.weight||0) > (prev.weight||0)) structGhostBestEdge.set(ghostId, e);
   });
-  const frontierEdges = [...ghostBestEdge.values()];
+
+  const allGhostIds   = [...typedGhostIds, ...structGhostIds];
+  const ghostIdSet    = new Set(allGhostIds);
+  const frontierEdges = [...typedGhostEdges, ...structGhostBestEdge.values()];
 
   const visEdges = [...richClassifiedEdges, ...frontierEdges];
 
@@ -397,10 +420,11 @@ async function loadGraph() {
       y: p?.y ?? (cy + (Math.random()-.5)*180),
     };
   });
-  const ghostNodes = ghostIds.map(id => {
+  const ghostNodes = allGhostIds.map(id => {
     const p = pos.get(id);
     return {
       id, title: id, ghost: true, primary_domain: 'other', depth_score: 1,
+      typed_ghost: typedGhostIds.has(id),
       x: p?.x ?? (cx + (Math.random()-.5)*300),
       y: p?.y ?? (cy + (Math.random()-.5)*300),
     };
@@ -553,13 +577,22 @@ function renderGraph() {
     const g = d3.select(this);
 
     // Ghost (frontier) nodes — visible dim dots, clickable
+    // Typed ghosts (connected via a real relationship) are slightly brighter and larger
     if (d.ghost) {
-      g.select('.node-main').attr('r', 5).attr('fill', '#3366aa').attr('opacity', 0.7);
-      g.select('.node-glow').attr('r', 9).attr('fill', '#2255aa').attr('opacity', 0.22);
+      const isTyped = d.typed_ghost;
+      g.select('.node-main').attr('r', isTyped ? 6 : 4)
+        .attr('fill', isTyped ? '#4488cc' : '#2d5590')
+        .attr('opacity', isTyped ? 0.85 : 0.55);
+      g.select('.node-glow').attr('r', isTyped ? 11 : 7)
+        .attr('fill', isTyped ? '#3377bb' : '#1e4070')
+        .attr('opacity', isTyped ? 0.28 : 0.14);
       g.select('.node-ring').attr('r', 0).attr('stroke', 'none');
       g.select('.node-conquest-ring').attr('opacity', 0);
       g.select('.node-core').attr('r', 0);
-      g.select('.node-label').attr('fill', '#2a4a7a').attr('dy', 18)
+      g.select('.node-label')
+        .attr('fill', isTyped ? '#4488cc' : '#2a4a7a')
+        .attr('dy', isTyped ? 20 : 16)
+        .attr('opacity', isTyped ? 0.9 : 0.55)
         .text(truncLabel(d.title));
       return;
     }
