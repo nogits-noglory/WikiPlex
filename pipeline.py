@@ -468,38 +468,62 @@ RULES FOR classification:
 - era: Use "timeless" for mathematics, logic, natural laws.
 
 RULES FOR triples:
-- Extract 8 to 18 triples. Every triple must include source_sentence copied exactly from the text.
+- Extract 8 to 20 triples. Every triple must include source_sentence copied exactly from the text.
 - object_is_link must be true only if the object appears in the outbound links list above.
 - Never emit a triple where subject and object are the same article.
+- AIM TO USE EVERY EDGE TYPE FAMILY. Push yourself to find temporal, implication, analogy, influence, and application edges, not just categorical and geographical ones.
 - Use ONLY these predicates:
 
-  INTERPERSONAL: married to, parent of, child of, sibling of, allied with, opposed by, mentored by, collaborated with, succeeded by, preceded by as leader
-  POSITIONAL: served as, founded, led, member of, employed by, created, invented, authored, directed, plays, plays as, competes in, written in
+  INTERPERSONAL: married to, parent of, child of, sibling of, allied with, opposed by, mentored, mentored by, collaborated with, succeeded by, preceded by as leader
+  POSITIONAL: served as, founded, led, member of, employed by, created, invented, authored, directed, plays, plays as, competes in, written in, set in, stars, depicts
   GEOGRAPHICAL: born in, died in, located in, originated in, conquered, invaded, capital of, broadcast in
   TEMPORAL: occurred during, caused by, resulted in, contemporaneous with, preceded by, succeeded by
-  CATEGORICAL: type of, subfield of, instance of, part of, used in, plays in, produces
+  CATEGORICAL: type of, subfield of, instance of, part of, used in, plays in, produces, competes in, depicts
   ETYMOLOGICAL: derived from, root meaning, synonym of, antonym of, also known as
   IMPLICATION: implies, is prerequisite for, enables, contradicts, historically led to, challenged by
   MISCONCEPTION: commonly confused with, often mistaken for, is not the same as, was historically misattributed to
-  ANALOGY: is analogous to, parallels, is the [domain] equivalent of
+  ANALOGY: is analogous to, parallels, is the equivalent of in
   INFLUENCE: influenced, was inspired by, gave rise to, is a precursor of, shaped the development of
   APPLICATION: is applied in, enables the study of, has applications in, underlies, is used to solve
 
 - edge_type must match the predicate family above.
 - Do not duplicate triples.
 
-CRITICAL predicate rules — these are the most common errors, avoid them:
+CRITICAL predicate rules — these are the most common errors:
+
+PEOPLE / PERSONS:
 - A PERSON is never "type of" a sport, discipline, or role. Use POSITIONAL instead.
   WRONG: {{ "subject": "Paolo DelPiccolo", "predicate": "type of", "object": "Association football" }}
   RIGHT: {{ "subject": "Paolo DelPiccolo", "predicate": "plays", "object": "Association football", "edge_type": "positional" }}
-- A SPORTS CLUB is never "type of" a sport. Use CATEGORICAL "competes in" or "plays in".
+- A PERSON is never "type of" a profession. Use POSITIONAL "served as".
+  WRONG: {{ "subject": "James Gilreath", "predicate": "type of", "object": "Songwriter" }}
+  RIGHT: {{ "subject": "James Gilreath", "predicate": "served as", "object": "Songwriter", "edge_type": "positional" }}
+- INTERPERSONAL predicates (parent of, mentored, collaborated with) are for people-to-people relationships only.
+
+FILMS / MEDIA:
+- A FILM is never "employed by" a setting, theme, or subject. Use POSITIONAL or CATEGORICAL.
+  WRONG: {{ "subject": "American Visa", "predicate": "employed by", "object": "Strip club" }}
+  RIGHT: {{ "subject": "American Visa", "predicate": "set in", "object": "Strip club", "edge_type": "positional" }}
+- A FILM is never "type of" a person or profession depicted in it.
+  WRONG: {{ "subject": "American Visa", "predicate": "type of", "object": "Exotic dancer" }}
+  RIGHT: {{ "subject": "American Visa", "predicate": "depicts", "object": "Exotic dancer", "edge_type": "categorical" }}
+
+SPORTS CLUBS:
+- A SPORTS CLUB is never "type of" a sport. Use CATEGORICAL "competes in".
   WRONG: {{ "subject": "G.D. Chaves", "predicate": "type of", "object": "Association football" }}
   RIGHT: {{ "subject": "G.D. Chaves", "predicate": "competes in", "object": "Association football", "edge_type": "categorical" }}
+
+PUBLICATIONS:
 - A PUBLICATION is never "type of" a language. Use POSITIONAL "written in".
-  WRONG: {{ "subject": "Público", "predicate": "type of", "object": "Portuguese language" }}
-  RIGHT: {{ "subject": "Público", "predicate": "written in", "object": "Portuguese language", "edge_type": "positional" }}
-- INTERPERSONAL predicates are for relationships between people, not between organizations or events.
-- "type of" means ontological classification (Epidendrum is a type of Orchid). Do not use it for membership, participation, or language.
+
+ONTOLOGY:
+- "type of" means strict ontological classification: Epidendrum is type of Orchid. Beetle is type of Insect.
+- Do NOT use "type of" for roles, participation, settings, or depicted subjects.
+
+MENTORSHIP DIRECTION:
+- "mentored" means the subject taught the object.
+  RIGHT: {{ "subject": "Pamphilus of Caesarea", "predicate": "mentored", "object": "Eusebius of Caesarea" }}
+- "mentored by" means the subject was taught by the object.
 
 RULES FOR curriculum:
 - dictionary: 8-14 entries. fromWiki false if term not in article but important.
@@ -690,6 +714,273 @@ def print_summary(graph: dict, node: dict, structural_edges: list, inferred_edge
     ok(f"Total frontier:    {len(graph['frontier'])}")
     log("─" * 60, DIM)
 
+# --- Cross-node edge inference ---
+
+CROSS_EDGE_PREDICATES = """
+  INTERPERSONAL: married to, parent of, child of, sibling of, allied with, opposed by, mentored, mentored by, collaborated with, succeeded by, preceded by as leader
+  POSITIONAL: served as, founded, led, member of, employed by, created, invented, authored, directed, plays, competes in, written in, set in, depicts
+  GEOGRAPHICAL: born in, died in, located in, originated in, conquered, invaded, capital of
+  TEMPORAL: occurred during, caused by, resulted in, contemporaneous with, preceded by, succeeded by
+  CATEGORICAL: type of, subfield of, instance of, part of, used in, produces, competes in
+  ETYMOLOGICAL: derived from, synonym of, also known as
+  IMPLICATION: implies, is prerequisite for, enables, contradicts, historically led to, challenged by
+  MISCONCEPTION: commonly confused with, often mistaken for, is not the same as
+  ANALOGY: is analogous to, parallels, is the equivalent of in
+  INFLUENCE: influenced, was inspired by, gave rise to, is a precursor of, shaped the development of
+  APPLICATION: is applied in, enables the study of, has applications in, underlies, is used to solve
+"""
+
+def build_cross_edges_prompt(new_title: str, new_text: str, existing_nodes: list) -> tuple:
+    node_lines = []
+    for n in existing_nodes[:50]:
+        hook = n.get("curiosity_hook") or ""
+        hook_str = (" | " + hook[:120]) if hook else ""
+        node_lines.append(f"  - {n['id']} ({n.get('primary_domain','?')}, {n.get('article_type','?')}){hook_str}")
+    node_list = "\n".join(node_lines)
+
+    system = (
+        "You are WikiFold's cross-reference engine. You find meaningful semantic relationships between "
+        "Wikipedia articles that a knowledgeable person would recognize as real. "
+        "You never hallucinate. Return only valid JSON with no markdown or preamble."
+    )
+
+    user = f"""We just classified the article "{new_title}".
+
+Here is an excerpt from its Wikipedia article:
+---
+{new_text[:3000]}
+---
+
+Here are {len(existing_nodes)} other articles already in our knowledge graph:
+{node_list}
+
+Find any GENUINE relationships between "{new_title}" and the listed articles.
+Only include relationships that are factually grounded and specific.
+Think broadly: geographical proximity, shared time periods, shared domain, causal links,
+analogies, mutual influence, shared people, shared themes.
+
+Return JSON exactly:
+{{
+  "cross_edges": [
+    {{
+      "from": "{new_title}",
+      "to": "exact title from the list above",
+      "predicate": "one predicate from the vocabulary",
+      "edge_type": "interpersonal | geographical | temporal | categorical | etymological | positional | implication | misconception | analogy | influence | application",
+      "reasoning": "one sentence factual justification"
+    }}
+  ]
+}}
+
+Predicate vocabulary:
+{CROSS_EDGE_PREDICATES}
+
+Rules:
+- "to" must be the exact title from the list above.
+- Never force a connection. If no genuine relationship exists, return {{"cross_edges": []}}.
+- Maximum 10 cross-edges.
+- Do not add edges between articles with no meaningful connection beyond both existing in Wikipedia."""
+
+    return system, user
+
+
+def generate_cross_edges(title: str, text: str, conn) -> list:
+    """Query existing classified nodes and ask the LLM to find cross-edges."""
+    if conn is None:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, primary_domain, article_type, curiosity_hook
+            FROM nodes
+            WHERE classified = true AND id != %s
+            ORDER BY classified_at DESC
+            LIMIT 60
+        """, (title,))
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        warn(f"Cross-edge query failed: {e}")
+        return []
+
+    if not rows:
+        return []
+
+    existing = [
+        {"id": r[0], "primary_domain": r[1], "article_type": r[2], "curiosity_hook": r[3]}
+        for r in rows
+    ]
+
+    log(f"  Running cross-node inference against {len(existing)} existing nodes...", SILVER)
+
+    system, user = build_cross_edges_prompt(title, text, existing)
+    try:
+        raw = call_api(system, user)
+    except Exception as e:
+        warn(f"  Cross-edge API call failed: {e}")
+        return []
+
+    try:
+        cleaned = re.sub(r"^```json\s*", "", raw, flags=re.I)
+        cleaned = re.sub(r"^```\s*", "", cleaned)
+        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+        data = json.loads(cleaned)
+        cross = data.get("cross_edges", [])
+    except Exception as e:
+        warn(f"  Cross-edge parse failed: {e}")
+        return []
+
+    valid_edge_types = {
+        "interpersonal", "geographical", "temporal", "categorical",
+        "etymological", "positional", "implication", "misconception",
+        "analogy", "influence", "application",
+    }
+    valid_ids = {n["id"] for n in existing}
+    now = datetime.now(timezone.utc).isoformat()
+
+    edges = []
+    for ce in cross:
+        if not isinstance(ce, dict):
+            continue
+        to = ce.get("to", "")
+        predicate = ce.get("predicate", "")
+        edge_type = ce.get("edge_type", "categorical")
+        if not to or not predicate:
+            continue
+        if to not in valid_ids:
+            continue
+        if to == title:
+            continue
+        if edge_type not in valid_edge_types:
+            edge_type = "categorical"
+        edges.append({
+            "from":            title,
+            "to":              to,
+            "type":            edge_type,
+            "predicate":       predicate,
+            "weight":          0.75,
+            "source":          "ai_inference",
+            "source_sentence": ce.get("reasoning", ""),
+            "created_at":      now,
+        })
+
+    if edges:
+        ok(f"  Cross-edges found: {len(edges)}")
+        for e in edges:
+            dim(f"    {e['from']} --[{e['predicate']}]--> {e['to']}")
+    else:
+        dim("  No cross-edges found.")
+
+    return edges
+
+
+# --- Repair: re-run cross-edge inference for all classified node pairs ---
+def repair_cross_edges():
+    """Re-run cross-edge inference for every classified node against all others."""
+    log("Cross-edge repair: scanning all classified nodes...", GOLD)
+    conn = get_db_conn()
+    if conn is None:
+        err("No DB connection.")
+        return
+
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, curiosity_hook FROM nodes WHERE classified = true ORDER BY classified_at DESC")
+        all_nodes = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        err(f"Query failed: {e}")
+        conn.close()
+        return
+
+    log(f"Found {len(all_nodes)} classified nodes. Checking each for cross-edges.", CYAN)
+    total_added = 0
+
+    for node_id, _ in all_nodes:
+        log(f"\nProcessing: {node_id}", CYAN)
+        # Fetch article text from Wikipedia for context
+        try:
+            wiki = fetch_wikipedia(node_id)
+        except Exception as e:
+            warn(f"  Wikipedia fetch failed: {e}")
+            continue
+
+        cross_edges = generate_cross_edges(node_id, wiki["text"], conn)
+        if cross_edges:
+            try:
+                db_write_edges(conn, cross_edges)
+                conn.commit()
+                total_added += len(cross_edges)
+            except Exception as e:
+                warn(f"  Edge write failed: {e}")
+                conn.rollback()
+
+    conn.close()
+    log(f"\nRepair complete: {total_added} cross-edges added across {len(all_nodes)} nodes.", GOLD)
+
+
+# --- Seeding: add high-quality canonical articles to frontier ---
+SEED_ARTICLES = [
+    "French Revolution",
+    "DNA",
+    "Quantum mechanics",
+    "Ancient Rome",
+    "Evolution",
+    "Philosophy",
+    "Mathematics",
+    "Democracy",
+    "Renaissance",
+    "World War II",
+    "Albert Einstein",
+    "Isaac Newton",
+    "Ancient Greece",
+    "Photosynthesis",
+    "Black hole",
+    "Capitalism",
+    "Feudalism",
+    "Silk Road",
+    "Byzantine Empire",
+    "Industrial Revolution",
+    "Printing press",
+    "Roman Republic",
+    "Scientific Revolution",
+    "The Enlightenment",
+    "Charles Darwin",
+    "Plato",
+    "Aristotle",
+    "Leonardo da Vinci",
+    "Shakespeare",
+    "Colonialism",
+]
+
+def seed_frontier():
+    """Add canonical high-quality articles to the frontier queue."""
+    conn = get_db_conn()
+    if conn is None:
+        err("No DB connection.")
+        return
+
+    cur = conn.cursor()
+    added = 0
+    for title in SEED_ARTICLES:
+        try:
+            cur.execute(
+                "INSERT INTO frontier (id, title, added_at) VALUES (%s, %s, NOW()) ON CONFLICT (id) DO NOTHING",
+                (title, title)
+            )
+            if cur.rowcount:
+                ok(f"  Queued: {title}")
+                added += 1
+            else:
+                dim(f"  Already queued: {title}")
+        except Exception as e:
+            warn(f"  Failed to queue {title}: {e}")
+    conn.commit()
+    cur.close()
+    conn.close()
+    ok(f"\nSeeded {added} articles into the frontier queue.")
+
+
 # --- Main pipeline ---
 def run(input_title: str):
     print()
@@ -870,6 +1161,28 @@ def run(input_title: str):
             else:
                 warn("Embedding skipped (sentence-transformers not installed)")
 
+            # Step 10b: Cross-node edge inference
+            log("Generating cross-node edges...", SILVER)
+            conn2 = get_db_conn()
+            if conn2:
+                try:
+                    cross_edges = generate_cross_edges(wiki["title"], wiki["text"], conn2)
+                    if cross_edges:
+                        db_write_edges(conn2, cross_edges)
+                        conn2.commit()
+                        # Also add to graph.json
+                        for e in cross_edges:
+                            key = (e["from"], e["to"], e["type"])
+                            if key not in existing_edge_keys:
+                                graph["edges"].append(e)
+                                existing_edge_keys.add(key)
+                        save_graph(graph)
+                except Exception as e:
+                    warn(f"Cross-edge step failed: {e}")
+                    conn2.rollback()
+                finally:
+                    conn2.close()
+
         except Exception as e:
             err(f"PostgreSQL write failed: {e}")
             conn.rollback()
@@ -973,11 +1286,11 @@ def fetch_random_title() -> str:
     return resp.json()["query"]["random"][0]["title"]
 
 # --- API key check ---
-API_KEY = os.getenv("LLM_API_KEY")
+API_KEY = os.getenv("LLM_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
 MODEL   = os.getenv("MODEL", "claude-haiku-4-5-20251001")
 
 if not API_KEY:
-    print("\n  ERROR: LLM_API_KEY not found in .env\n")
+    print("\n  ERROR: LLM_API_KEY (or ANTHROPIC_API_KEY) not found in .env\n")
     sys.exit(1)
 
 # --- Entry point ---
@@ -1005,6 +1318,15 @@ if __name__ == "__main__":
         log(f"  Seed: {random_title}", GOLD)
         run(random_title)
 
+    elif "--repair-cross" in args:
+        # Re-run cross-edge inference for all classified nodes
+        repair_cross_edges()
+
+    elif "--reseed" in args:
+        # Add canonical high-quality articles to the frontier
+        log("Seeding frontier with canonical articles...", GOLD)
+        seed_frontier()
+
     elif args:
         run(" ".join(args))
 
@@ -1019,6 +1341,8 @@ if __name__ == "__main__":
         dim("python pipeline.py --random               classify a random article")
         dim("python pipeline.py --worker               drain the frontier queue (batch 5)")
         dim("python pipeline.py --worker --batch=10    drain 10 items at a time")
+        dim("python pipeline.py --reseed               add 30 canonical articles to the frontier")
+        dim("python pipeline.py --repair-cross         re-run cross-edge inference for all nodes")
         print()
         title = input(f"{GOLD}  Article title (or press Enter for random): {RESET}").strip()
         if not title:
