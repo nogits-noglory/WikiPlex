@@ -1,13 +1,14 @@
 
 'use strict';
 
-const PROXY_API   = '/api/generate';
-const GRAPH_API   = '/api/graph';
-const STREAM_API  = '/api/graph/stream';
-const SEARCH_API  = '/api/search';
-const NODE_API    = '/api/node';
-const STATS_API   = '/api/stats';
-const TOPIC_MAX   = 200;
+const PROXY_API    = '/api/generate';
+const GRAPH_API    = '/api/graph';
+const STREAM_API   = '/api/graph/stream';
+const SEARCH_API   = '/api/search';
+const NODE_API     = '/api/node';
+const STATS_API    = '/api/stats';
+const PATHFIND_API = '/api/pathfind';
+const TOPIC_MAX    = 200;
 
 const TIERS = {
   novice:       { label:'Novice',       count:10, icon:'▷', desc:'Core concepts only.' },
@@ -49,6 +50,34 @@ function setPS(id, lvl){
   }
 }
 
+/* ── Curriculum localStorage cache ── */
+function curKey(title) {
+  return 'wd_cur_' + title.toLowerCase().replace(/[^a-z0-9]/g,'_').slice(0,60);
+}
+function saveCurriculumLocal(title, cur) {
+  try {
+    localStorage.setItem(curKey(title), JSON.stringify({ title, curriculum: cur, savedAt: Date.now() }));
+  } catch {}
+}
+function loadCurriculumLocal(title) {
+  try {
+    const d = JSON.parse(localStorage.getItem(curKey(title)) || 'null');
+    return d?.curriculum || null;
+  } catch { return null; }
+}
+function getAllStoredCurricula() {
+  const out = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k?.startsWith('wd_cur_')) continue;
+      const d = JSON.parse(localStorage.getItem(k) || 'null');
+      if (d?.title && d?.curriculum) out.push(d);
+    }
+  } catch {}
+  return out.sort((a,b) => (b.savedAt||0) - (a.savedAt||0));
+}
+
 const DOMAIN_COLOR = {
   mathematics:'#00b4d8', physics:'#7209b7',    chemistry:'#f77f00',
   biology:'#52b788',     medicine:'#e63946',    psychology:'#ff9f1c',
@@ -63,13 +92,26 @@ const DOMAIN_COLOR = {
 function domainColor(d) { return DOMAIN_COLOR[d] || '#6c757d'; }
 
 const EDGE_COLOR = {
+  // Original families
   interpersonal:'#dd4444', geographical:'#2299aa',
   temporal:'#aa7700',      categorical:'#338866',
   etymological:'#7744aa',  positional:'#996600',
-  structural:'rgba(60,120,200,0.25)',
+  // Extended families
+  implication:'#e8890c',   misconception:'#cc3377',
+  analogy:'#11bbaa',       influence:'#e040fb',
+  application:'#26c6da',   semantic:'#9966dd',
+  // Structural (Wikipedia link graph — ghost connections only)
+  structural:'rgba(60,120,200,0.18)',
 };
 function edgeColor(e) {
-  return e._src === 'ai_inference' ? (EDGE_COLOR[e.type] || '#3a3a66') : EDGE_COLOR.structural;
+  if (e._src === 'ai_inference' || e._src === 'embedding_similarity') {
+    return EDGE_COLOR[e.type] || '#5566aa';
+  }
+  return EDGE_COLOR.structural;
+}
+/* Returns true for any edge type richer than a raw wiki link */
+function isRichEdge(d) {
+  return d._src === 'ai_inference' || d._src === 'embedding_similarity';
 }
 function nodeRadius(d) { return 6 + (d.depth_score || 3) * 1.8; }
 
@@ -107,23 +149,46 @@ let state = {
 let panelMode = 'idle';
 
 function showPC(id) {
-  ['pc-idle','pc-loading','pc-article','pc-node','pc-study']
+  ['pc-idle','pc-loading','pc-article','pc-node','pc-study','pc-pathfind']
     .forEach(pc => $(pc).classList.toggle('hidden', pc !== id));
 }
 
 function openPanel(mode) {
   panelMode = mode;
   $('detail-panel').classList.add('open');
+  $('btn-back-to-map')?.classList.remove('hidden');
   // Push graph center left so nodes don't hide behind panel
   if (window.innerWidth > 768) nudgeGraph(true);
 }
 function closePanel() {
+  // Don't let generic closePanel tear down path mode — use exitPathMode() for that
+  if (panelMode === 'pathfind') return;
   $('detail-panel').classList.remove('open');
   $('study-tabs').classList.add('hidden');
+  $('btn-back-to-map')?.classList.add('hidden');
   showPC('pc-idle');
   panelMode = 'idle';
   deselect();
   if (window.innerWidth > 768) nudgeGraph(false);
+  renderLibrary();
+}
+
+function renderLibrary() {
+  const el = $('idle-library');
+  if (!el) return;
+  const entries = getAllStoredCurricula();
+  if (!entries.length) { el.innerHTML = ''; return; }
+  const rows = entries.slice(0, 12).map(d => {
+    const ps = getPS(d.title);
+    const psLabel = ps >= PS.CONQUERED ? 'conquered' : ps >= PS.STUDIED ? 'studied' : 'viewed';
+    const psText  = ps >= PS.CONQUERED ? '★ Conquered' : ps >= PS.STUDIED ? 'Studied' : 'Viewed';
+    const domain  = d.curriculum?.dictionary?.[0] ? 'other' : 'other';
+    return `<div class="lib-entry" data-action="openFromLibrary" data-title="${esc(d.title)}">
+      <div class="lib-entry-title">${esc(d.title)}</div>
+      <span class="lib-entry-state ${psLabel}">${psText}</span>
+    </div>`;
+  }).join('');
+  setHTML(el, `<div class="idle-library-title">My Library</div>${rows}`);
 }
 
 function setPanelHeader(title, badge, wikiUrl) {
@@ -162,6 +227,16 @@ let simulation, sseSource;
 let gNodes = [], gLinks = [];
 let rawNodes = {};
 let selectedNodeId = null;
+const queuedTitles = new Set(); // titles queued this session — persists across panel open/close
+
+/* ── Path Finder state ── */
+let pathMode       = false;
+let pathSessionId  = null;
+let pathSse        = null;
+let pathFrom       = '';
+let pathTo         = '';
+let pathResults    = {}; // type -> { nodes, edges }
+let savedGraph     = null; // { gNodes, gLinks, rawNodes } snapshot saved on enterPathMode
 
 const zoomBehavior = d3.zoom()
   .scaleExtent([0.05, 12])
@@ -216,19 +291,40 @@ function makeSimulation() {
   return d3.forceSimulation()
     .force('link', d3.forceLink()
       .id(d => d.id)
-      .distance(d => d._src === 'ai_inference' ? 130 : 175)
-      .strength(d => d._src === 'ai_inference' ? 0.55 : 0.2)
+      .distance(d => {
+        if (d._src === 'embedding_similarity') return 160; // semantic — medium pull
+        if (d._src === 'ai_inference')         return 120; // typed — close
+        return 220; // structural/frontier — push to periphery
+      })
+      .strength(d => {
+        if (d._src === 'embedding_similarity') return 0.30;
+        if (d._src === 'ai_inference')         return 0.55;
+        return 0.08; // structural — very weak, just keeps frontier attached
+      })
     )
     .force('charge', d3.forceManyBody()
-      .strength(d => -(260 + (d.depth_score || 3) * 28))
-      .distanceMax(520)
+      .strength(d => d.ghost ? -120 : -(320 + (d.depth_score || 3) * 32))
+      .distanceMax(600)
     )
     .force('collide', d3.forceCollide()
-      .radius(d => nodeRadius(d) + 34)
-      .iterations(2)
+      .radius(d => (d.ghost ? 12 : nodeRadius(d)) + 28)
+      .iterations(3)
     )
-    .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.06))
-    .alphaDecay(0.022);
+    .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.05))
+    // Soft domain-clustering: pull nodes with the same primary domain toward each other
+    .force('domain_x', d3.forceX(d => {
+      if (d.ghost) return graphCenterX();
+      const domainIndex = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
+      const angle = (domainIndex / Object.keys(DOMAIN_COLOR).length) * 2 * Math.PI;
+      return graphCenterX() + Math.cos(angle) * 140;
+    }).strength(0.04))
+    .force('domain_y', d3.forceY(d => {
+      if (d.ghost) return H() / 2;
+      const domainIndex = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
+      const angle = (domainIndex / Object.keys(DOMAIN_COLOR).length) * 2 * Math.PI;
+      return H() / 2 + Math.sin(angle) * 140;
+    }).strength(0.04))
+    .alphaDecay(0.018);
 }
 
 /* ── Load graph from API ── */
@@ -251,12 +347,17 @@ async function loadGraph() {
     return;
   }
 
-  // Show all edges where both classified nodes exist, PLUS frontier ghost nodes
-  // for the top-K most-connected unclassified neighbors (limited for performance)
   const allEdges = (data.edges || []);
-  const classifiedEdges = allEdges.filter(e => nodeIds.has(e.from) && nodeIds.has(e.to));
 
-  // Build frontier ghost nodes from top-50 most-referenced unclassified neighbors
+  // ── Classified↔Classified edges:
+  //    Only show rich (non-structural) edges between classified nodes.
+  //    Raw "links to" structural edges are pure visual noise at scale.
+  const richClassifiedEdges = allEdges.filter(e =>
+    nodeIds.has(e.from) && nodeIds.has(e.to) && e.source !== 'wikipedia_links'
+  );
+
+  // ── Ghost (frontier) nodes: top-45 most-referenced unclassified neighbors
+  //    with at least 2 references — reduces peripheral clutter.
   const neighborCount = new Map();
   allEdges.forEach(e => {
     if (nodeIds.has(e.from) && !nodeIds.has(e.to))
@@ -265,34 +366,37 @@ async function loadGraph() {
       neighborCount.set(e.from, (neighborCount.get(e.from)||0)+1);
   });
   const ghostIds = [...neighborCount.entries()]
+    .filter(([, count]) => count >= 2)     // must be referenced by 2+ classified nodes
     .sort((a,b) => b[1]-a[1])
-    .slice(0, 80)
+    .slice(0, 45)
     .map(([id]) => id);
   const ghostIdSet = new Set(ghostIds);
 
-  // Edges: classified↔classified + classified↔ghost (top-80 frontier)
-  const frontierEdges = allEdges.filter(e =>
-    (nodeIds.has(e.from) && ghostIdSet.has(e.to)) ||
-    (nodeIds.has(e.to) && ghostIdSet.has(e.from))
-  );
+  // One structural edge per ghost node — the highest-weight one connecting it to a classified node
+  const ghostBestEdge = new Map();
+  allEdges.forEach(e => {
+    const fromGhost = ghostIdSet.has(e.from) && nodeIds.has(e.to);
+    const toGhost   = ghostIdSet.has(e.to)   && nodeIds.has(e.from);
+    if (!fromGhost && !toGhost) return;
+    const ghostId = fromGhost ? e.from : e.to;
+    const prev = ghostBestEdge.get(ghostId);
+    if (!prev || (e.weight || 0) > (prev.weight || 0)) ghostBestEdge.set(ghostId, e);
+  });
+  const frontierEdges = [...ghostBestEdge.values()];
 
-  // Where an AI edge exists for a pair, drop the structural duplicate
-  const allVisEdges = [...classifiedEdges, ...frontierEdges];
-  const aiPairs = new Set(
-    allVisEdges.filter(e => e.source === 'ai_inference').map(e => `${e.from}||${e.to}`)
-  );
-  const visEdges = allVisEdges.filter(e =>
-    e.source === 'ai_inference' || !aiPairs.has(`${e.from}||${e.to}`)
-  );
+  const visEdges = [...richClassifiedEdges, ...frontierEdges];
 
-  // Preserve positions from previous render
+  // Preserve positions from previous render; seed new nodes near center
+  const cx = graphCenterX(), cy = H()/2;
   const pos = new Map(gNodes.map(n => [n.id, {x:n.x, y:n.y}]));
   const classifiedNodes = Object.values(rawNodes).map(n => {
     const p = pos.get(n.id);
-    return { ...n, x: p?.x, y: p?.y };
+    return {
+      ...n,
+      x: p?.x ?? (cx + (Math.random()-.5)*180),
+      y: p?.y ?? (cy + (Math.random()-.5)*180),
+    };
   });
-  // Ghost nodes placed randomly near center
-  const cx = graphCenterX(), cy = H()/2;
   const ghostNodes = ghostIds.map(id => {
     const p = pos.get(id);
     return {
@@ -305,13 +409,14 @@ async function loadGraph() {
 
   gLinks = visEdges.map(e => ({
     ...e,
-    _src:   e.source,   // 'ai_inference' | 'wikipedia_links'
+    _src:   e.source,   // 'ai_inference' | 'embedding_similarity' | 'wikipedia_links'
     source: e.from,
     target: e.to,
   }));
 
   renderGraph();
   updateStats(data.meta);
+  requestAnimationFrame(() => { if (!graphPanelOpen) fitGraph(500); });
 }
 
 /* ── Render / update graph ── */
@@ -320,43 +425,64 @@ function renderGraph() {
 
   const tooltip = $('edge-tooltip');
 
+  /* ── Edge key function (used for both selections) ── */
+  const edgeKey = d => `${d.from}||${d.to}||${d.predicate}`;
+
   /* ── Edge visual lines ── */
   const visLines = edgeVisG.selectAll('line.ev')
-    .data(gLinks, d => `${d.from}||${d.to}||${d.predicate}`)
+    .data(gLinks, edgeKey)
     .join(
-      enter => enter.append('line').attr('class','ev edge-visual')
+      enter => enter.append('line').attr('class', d => `ev edge-visual et-${d.type||'structural'}`)
         .attr('stroke-opacity',0)
         .call(s => s.transition().duration(500).attr('stroke-opacity',
-          d => d._src === 'ai_inference' ? 0.75 : 1)),
-      update => update,
+          d => isRichEdge(d) ? 0.78 : 0.45)),
+      update => update.attr('class', d => `ev edge-visual et-${d.type||'structural'}`),
       exit => exit.transition().duration(250).attr('stroke-opacity',0).remove()
     )
     .attr('stroke', d => edgeColor(d))
-    .attr('stroke-width', d => d._src === 'ai_inference' ? 1.8 : 0.8);
+    .attr('stroke-width', d => {
+      if (d._src === 'embedding_similarity') return 1.4;
+      if (d._src === 'ai_inference')         return 1.8;
+      return 0.65;
+    })
+    .attr('stroke-dasharray', d => d._src === 'embedding_similarity' ? '5,3' : 'none');
 
-  /* ── Edge hit areas ── */
+  /* ── Edge tooltip builder ── */
+  function edgeTip(d) {
+    const ec = edgeColor(d);
+    if (d._src === 'embedding_similarity') {
+      return `<span class="et-badge" style="color:${ec}">semantic</span><span class="et-pred">~${(d.weight*100).toFixed(0)}% similar</span>`;
+    }
+    if (!isRichEdge(d)) {
+      return `<span class="et-badge" style="color:rgba(100,150,200,0.7)">link</span><span class="et-pred">links to</span>`;
+    }
+    return `<span class="et-badge" style="color:${ec}">${esc(d.type||'?')}</span><span class="et-pred">${esc(d.predicate)}</span>`;
+  }
+
+  /* ── Edge hit areas — ALL edges hoverable; rich edges also clickable ── */
   const hitLines = edgeHitG.selectAll('line.eh')
-    .data(gLinks, d => `${d.from}||${d.to}||${d.predicate}`)
+    .data(gLinks, edgeKey)
     .join('line')
-    .attr('class', d => `eh edge-hit${d._src === 'ai_inference' ? ' clickable' : ''}`)
+    .attr('class', d => `eh edge-hit${isRichEdge(d) ? ' clickable' : ''}`)
     .attr('stroke','transparent')
-    .attr('stroke-width', 14)
+    .attr('stroke-width', d => isRichEdge(d) ? 16 : 10)
     .on('mouseenter', (event, d) => {
-      if (d._src !== 'ai_inference') return;
+      // Fade all vis lines; un-fade the hovered one using datum identity (not index)
       edgeVisG.selectAll('line.ev').classed('faded', true);
-      d3.select(visLines.nodes()[gLinks.indexOf(d)]).classed('faded',false).classed('hovered',true);
-      tooltip.innerHTML = `<span>${esc(d.predicate)}</span>`;
-      tooltip.style.display = 'block';
+      edgeVisG.selectAll('line.ev')
+        .filter(dd => edgeKey(dd) === edgeKey(d))
+        .classed('faded', false).classed('hovered', true);
+      tooltip.innerHTML = edgeTip(d);
+      tooltip.style.display = 'flex';
       moveTooltip(event, tooltip);
     })
     .on('mousemove', (event) => moveTooltip(event, tooltip))
-    .on('mouseleave', (event, d) => {
-      if (d._src !== 'ai_inference') return;
+    .on('mouseleave', () => {
       edgeVisG.selectAll('line.ev').classed('faded',false).classed('hovered',false);
       tooltip.style.display = 'none';
     })
     .on('click', (event, d) => {
-      if (d._src !== 'ai_inference') return;
+      if (!isRichEdge(d)) return; // structural frontier edges: let click fall through to canvas
       event.stopPropagation();
       tooltip.style.display = 'none';
       showEdgePanel(d);
@@ -623,6 +749,433 @@ function connectSSE() {
   });
 }
 
+/* ══════════════════════════════════════════════
+   KNOWLEDGE PATH FINDER
+══════════════════════════════════════════════ */
+
+/* Enter isolated path mode: save graph, clear display */
+function enterPathMode(fromTitle, toTitle, sessionId) {
+  pathMode      = true;
+  pathFrom      = fromTitle;
+  pathTo        = toTitle;
+  pathSessionId = sessionId;
+  pathResults   = {};
+
+  // Save current graph state so we can restore it on exit
+  savedGraph = { gNodes: [...gNodes], gLinks: [...gLinks], rawNodes: { ...rawNodes } };
+
+  // Clear SVG to show only path nodes
+  gNodes = [];
+  gLinks = [];
+  rawNodes = {};
+  renderGraph();
+
+  // Open the path panel
+  $('study-tabs').classList.add('hidden');
+  setPanelHeader('Knowledge Path', null, null);
+  renderPathPanel('searching');
+  showPC('pc-pathfind');
+  openPanel('pathfind');
+
+  // Persist session for reconnect
+  try {
+    localStorage.setItem('wd_path_session', JSON.stringify({
+      sessionId, from: fromTitle, to: toTitle, startedAt: Date.now()
+    }));
+  } catch {}
+
+  connectPathSSE(sessionId);
+}
+
+/* Exit path mode: restore graph and close panel */
+function exitPathMode() {
+  pathMode  = false;
+  panelMode = 'idle'; // reset before closePanel guard checks it
+  if (pathSse) { pathSse.close(); pathSse = null; }
+  try { localStorage.removeItem('wd_path_session'); } catch {}
+
+  // Restore full graph
+  if (savedGraph) {
+    gNodes   = savedGraph.gNodes;
+    gLinks   = savedGraph.gLinks;
+    rawNodes = savedGraph.rawNodes;
+    savedGraph = null;
+    renderGraph();
+  } else {
+    loadGraph();
+  }
+
+  // Hide resume banner
+  const banner = $('path-resume-banner');
+  if (banner) banner.classList.add('hidden');
+
+  // Close the panel properly
+  $('detail-panel').classList.remove('open');
+  $('study-tabs').classList.add('hidden');
+  $('btn-back-to-map')?.classList.add('hidden');
+  showPC('pc-idle');
+  deselect();
+  if (window.innerWidth > 768) nudgeGraph(false);
+  renderLibrary();
+}
+
+/* Add a node from path results to the path-mode graph */
+function addPathNode(node) {
+  if (!pathMode || !node) return;
+  if (gNodes.find(n => n.id === (node.id || node.title))) return;
+  rawNodes[node.id || node.title] = node;
+  const cx = graphCenterX(), cy = H() / 2;
+  gNodes.push({ ...node, x: cx + (Math.random() - .5) * 220, y: cy + (Math.random() - .5) * 220 });
+  renderGraph();
+}
+
+/* Add edges from a found path result */
+function addPathEdges(edges) {
+  if (!pathMode || !edges?.length) return;
+  let added = false;
+  for (const e of edges) {
+    const from = e.from_node || e.from;
+    const to   = e.to_node   || e.to;
+    if (!from || !to) continue;
+    const key = `${from}||${to}||${e.predicate}`;
+    if (gLinks.find(l => `${l.from}||${l.to}||${l.predicate}` === key)) continue;
+    gLinks.push({
+      from, to, type: e.edge_type || e.type,
+      predicate: e.predicate || '',
+      _src: e.edge_source === 'embedding_similarity' ? 'embedding_similarity' : 'ai_inference',
+      weight: e.weight || 1,
+      source: from, target: to,
+    });
+    added = true;
+  }
+  if (added) renderGraph();
+}
+
+/* Render path panel content */
+function renderPathPanel(phase) {
+  const el = $('pc-pathfind');
+  if (!el) return;
+
+  const foundPaths = Object.entries(pathResults).filter(([, p]) => p);
+  const cardsHTML  = foundPaths.map(([type, path]) => renderPathCard(type, path)).join('');
+
+  const statusDot  = (phase === 'searching')
+    ? '<span class="pf-status-dot"></span>'
+    : (phase === 'complete' ? '<span class="pf-status-dot done"></span>' : '');
+
+  const statusText = phase === 'complete'
+    ? `Found ${foundPaths.length} path${foundPaths.length !== 1 ? 's' : ''}`
+    : phase === 'error' ? 'Search encountered an error'
+    : $('pf-status-msg')?.textContent || 'Searching...';
+
+  setHTML(el, `
+    <div class="pf-panel-header">
+      <div class="pf-panel-route">
+        <span class="pf-endpoint" title="${esc(pathFrom)}">${esc(pathFrom.length > 22 ? pathFrom.slice(0,21)+'...' : pathFrom)}</span>
+        <span class="pf-arrow">&#8594;</span>
+        <span class="pf-endpoint" title="${esc(pathTo)}">${esc(pathTo.length > 22 ? pathTo.slice(0,21)+'...' : pathTo)}</span>
+      </div>
+    </div>
+    <div class="pf-status-bar" id="pf-status-bar">
+      ${statusDot}
+      <span id="pf-status-msg">${esc(statusText)}</span>
+    </div>
+    <div class="pf-cards" id="pf-cards">
+      ${cardsHTML || (phase === 'searching' ? '<div class="pf-no-path">Searching for connections...</div>' : '')}
+    </div>
+    <div class="pf-exit-wrap">
+      <button class="btn-pf-exit" id="btn-pf-exit">EXIT PATH MODE</button>
+    </div>
+  `);
+
+  $('btn-pf-exit')?.addEventListener('click', exitPathMode);
+}
+
+/* Render a single path card */
+function renderPathCard(type, path) {
+  const color = EDGE_COLOR[type] || '#5566aa';
+  const nodes = path.nodes || [];
+  const hops  = nodes.length - 1;
+
+  const chain = nodes.map((n, i) => {
+    const isEnd = i === 0 || i === nodes.length - 1;
+    return `<span class="pf-chain-node${isEnd ? ' endpoint' : ''}"
+              style="border-color:${color}55"
+              data-action="pfNodeClick" data-title="${esc(n)}"
+              title="${esc(n)}">${esc(n.length > 20 ? n.slice(0,19)+'...' : n)}</span>${
+      i < nodes.length - 1 ? '<span class="pf-chain-arrow">&#8594;</span>' : ''}`;
+  }).join('');
+
+  const label = type.charAt(0).toUpperCase() + type.slice(1);
+
+  return `<div class="pf-path-card" data-type="${esc(type)}">
+    <div class="pf-card-header">
+      <span class="pf-card-dot" style="background:${color}"></span>
+      <span class="pf-card-type" style="color:${color}">${esc(label)}</span>
+      <span class="pf-card-hops">${hops} hop${hops !== 1 ? 's' : ''}</span>
+    </div>
+    <div class="pf-card-chain">${chain}</div>
+    <div class="pf-card-summary">"${esc(pathFrom)}" reached "${esc(pathTo)}" in ${hops} ${hops === 1 ? 'jump' : 'jumps'} via ${esc(label.toLowerCase())} connections</div>
+  </div>`;
+}
+
+/* Update just the status bar text without full re-render */
+function setPfStatus(msg) {
+  const el = $('pf-status-msg');
+  if (el) el.textContent = msg;
+}
+
+/* Append a new path card to the cards container */
+function appendPathCard(type, path) {
+  pathResults[type] = path;
+  const container = $('pf-cards');
+  if (!container) return;
+
+  // Remove "Searching..." placeholder
+  const placeholder = container.querySelector('.pf-no-path');
+  if (placeholder) placeholder.remove();
+
+  const div = document.createElement('div');
+  div.innerHTML = safeHTML(renderPathCard(type, path));
+  container.appendChild(div.firstElementChild);
+}
+
+/* Connect SSE for a path session */
+function connectPathSSE(sessionId) {
+  if (pathSse) pathSse.close();
+  pathSse = new EventSource(`${PATHFIND_API}/stream/${sessionId}`);
+
+  pathSse.addEventListener('message', e => {
+    try {
+      const ev = JSON.parse(e.data);
+      handlePathEvent(ev);
+    } catch {}
+  });
+
+  pathSse.addEventListener('error', () => {
+    // SSE will auto-reconnect if server is still running
+  });
+}
+
+/* Handle incoming path session events */
+function handlePathEvent(ev) {
+  switch (ev.type) {
+    case 'status':
+      setPfStatus(ev.msg || '');
+      break;
+
+    case 'warn':
+      setPfStatus(ev.msg || '');
+      break;
+
+    case 'node_ready':
+      if (ev.node) {
+        addPathNode(ev.node);
+        showToast(`+ ${ev.node.title || ev.node.id}`);
+      }
+      break;
+
+    case 'path_found':
+      if (ev.nodes?.length && ev.path_type) {
+        const path = { nodes: ev.nodes, edges: ev.edges || [] };
+        appendPathCard(ev.path_type, path);
+        addPathEdges(ev.edges || []);
+        // Ensure all path nodes are represented in the D3 graph
+        for (const title of ev.nodes) {
+          if (!gNodes.find(n => n.id === title)) {
+            addPathNode({ id: title, title, classified: false, primary_domain: 'other', depth_score: 3 });
+          }
+        }
+      }
+      break;
+
+    case 'complete':
+      if (pathSse) { pathSse.close(); pathSse = null; }
+      try { localStorage.removeItem('wd_path_session'); } catch {}
+      renderPathPanel('complete');
+      break;
+
+    case 'error':
+      setPfStatus(`Error: ${ev.message || 'unknown'}`);
+      renderPathPanel('error');
+      break;
+  }
+}
+
+/* ── Path Finder Modal ── */
+let pfFromVal = '', pfToVal = '';
+
+let pfAcInitialized = false;
+
+function openPathModal() {
+  const modal = $('pathfind-modal');
+  if (!modal) return;
+  modal.classList.remove('hidden');
+
+  const fromInput = $('pf-from-input');
+  const toInput   = $('pf-to-input');
+  if (fromInput) { fromInput.value = ''; setTimeout(() => fromInput.focus(), 50); }
+  if (toInput)   { toInput.value = ''; }
+
+  // Set up autocomplete once
+  if (!pfAcInitialized) {
+    setupPfAc('pf-from-input', 'pf-from-ac');
+    setupPfAc('pf-to-input',   'pf-to-ac');
+    pfAcInitialized = true;
+  }
+
+  const goBtn = $('btn-pf-go');
+  if (goBtn) { goBtn.disabled = false; goBtn.textContent = 'FIND PATH'; }
+}
+
+function closePathModal() {
+  const modal = $('pathfind-modal');
+  if (modal) modal.classList.add('hidden');
+}
+
+function setupPfAc(inputId, dropdownId) {
+  const inp = $(inputId);
+  const dd  = $(dropdownId);
+  if (!inp || !dd) return;
+
+  let items = [], sel = -1, timer = null;
+
+  function closeAcLocal() { dd.innerHTML = ''; dd.classList.remove('open'); sel = -1; }
+
+  function renderAcLocal() {
+    if (!items.length) { closeAcLocal(); return; }
+    setHTML(dd, items.map((it, i) =>
+      `<div class="pf-ac-item${i === sel ? ' sel' : ''}" data-idx="${i}">
+        <span class="pf-ac-name">${esc(it.title)}</span>
+        <span class="pf-ac-desc">${esc(it.desc || '')}</span>
+      </div>`
+    ).join(''));
+    dd.classList.add('open');
+    dd.querySelectorAll('.pf-ac-item').forEach(el => {
+      el.addEventListener('mousedown', ev => {
+        ev.preventDefault();
+        inp.value = items[parseInt(el.dataset.idx)].title;
+        closeAcLocal();
+      });
+    });
+  }
+
+  async function suggest(q) {
+    if (!q || q.length < 2) { closeAcLocal(); return; }
+    try {
+      const r = await fetch(`${SEARCH_API}?q=${encodeURIComponent(q)}`);
+      const d = await r.json();
+      if (d.results?.length) {
+        items = d.results.map(n => ({ title: n.title, desc: n.primary_domain || '' }));
+        renderAcLocal(); return;
+      }
+    } catch {}
+    try {
+      const r = await fetch(`${WIKI_API}?action=opensearch&search=${encodeURIComponent(q)}&limit=5&redirects=resolve&format=json&origin=*`);
+      const d = await r.json();
+      items = (d[1] || []).map((t, i) => ({ title: t, desc: (d[2] || [])[i] || '' })).filter(it => it.title);
+      renderAcLocal();
+    } catch { closeAcLocal(); }
+  }
+
+  inp.addEventListener('input', () => {
+    clearTimeout(timer); sel = -1;
+    timer = setTimeout(() => suggest(inp.value.trim()), 250);
+  });
+  inp.addEventListener('keydown', e => {
+    const open = dd.classList.contains('open');
+    if (open && items.length) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(sel + 1, items.length - 1); renderAcLocal(); return; }
+      if (e.key === 'ArrowUp')   { e.preventDefault(); sel = Math.max(sel - 1, -1); renderAcLocal(); return; }
+      if (e.key === 'Enter' && sel >= 0) { e.preventDefault(); inp.value = items[sel].title; closeAcLocal(); return; }
+      if (e.key === 'Escape') { closeAcLocal(); return; }
+    }
+  });
+  inp.addEventListener('blur', () => setTimeout(closeAcLocal, 160));
+}
+
+async function startPathFind() {
+  const fromTitle = ($('pf-from-input')?.value || '').trim();
+  const toTitle   = ($('pf-to-input')?.value   || '').trim();
+
+  if (!fromTitle || !toTitle) {
+    showToast('Enter both article titles', 2500);
+    return;
+  }
+  if (fromTitle === toTitle) {
+    showToast('Choose two different articles', 2500);
+    return;
+  }
+
+  const goBtn = $('btn-pf-go');
+  if (goBtn) { goBtn.disabled = true; goBtn.textContent = 'Starting...'; }
+
+  try {
+    const r = await fetch(PATHFIND_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ from: fromTitle, to: toTitle }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Request failed');
+
+    closePathModal();
+
+    // Show queue info briefly before entering path mode
+    if (d.ahead > 0) {
+      showToast(`${d.ahead} user${d.ahead !== 1 ? 's' : ''} ahead of you in queue`, 3000);
+    }
+
+    enterPathMode(fromTitle, toTitle, d.sessionId);
+
+  } catch (e) {
+    showToast(`Path find failed: ${e.message}`, 4000);
+    if (goBtn) { goBtn.disabled = false; goBtn.textContent = 'FIND PATH'; }
+  }
+}
+
+/* Check localStorage for an active path session on page load */
+async function checkPathResume() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem('wd_path_session') || 'null'); } catch { return; }
+  if (!saved?.sessionId) return;
+
+  // Check if session is still relevant
+  try {
+    const r = await fetch(`${PATHFIND_API}/status/${saved.sessionId}`);
+    if (!r.ok) { localStorage.removeItem('wd_path_session'); return; }
+    const d = await r.json();
+    if (d.status === 'complete' || d.status === 'error') {
+      localStorage.removeItem('wd_path_session');
+      return;
+    }
+  } catch { return; }
+
+  // Show resume banner
+  const banner = $('path-resume-banner');
+  if (!banner) return;
+  const msg    = banner.querySelector('.path-resume-msg');
+  if (msg) {
+    msg.innerHTML = safeHTML(
+      `Path session in progress: <strong>${esc(saved.from)}</strong> &#8594; <strong>${esc(saved.to)}</strong>`
+    );
+  }
+  banner.classList.remove('hidden');
+
+  banner.querySelector('.btn-resume-path')?.addEventListener('click', () => {
+    banner.classList.add('hidden');
+    pathFrom      = saved.from;
+    pathTo        = saved.to;
+    pathSessionId = saved.sessionId;
+    enterPathMode(saved.from, saved.to, saved.sessionId);
+  });
+
+  banner.querySelector('.btn-dismiss-resume')?.addEventListener('click', () => {
+    banner.classList.add('hidden');
+    localStorage.removeItem('wd_path_session');
+  });
+}
+
 /* ──────────────────────────────────────────────
    NODE CLICK HANDLER
    - if classified (in rawNodes): show node panel
@@ -704,39 +1257,91 @@ function ndRow(k,v) {
 /* ──────────────────────────────────────────────
    EDGE CONNECTION PANEL
 ────────────────────────────────────────────── */
+/* Human-readable description for each edge family */
+const EDGE_DESC = {
+  interpersonal: 'A personal or social relationship between people.',
+  geographical:  'A geographic connection — place of origin, location, or territory.',
+  temporal:      'A cause-and-effect or timing relationship in history.',
+  categorical:   'A classification or taxonomic relationship.',
+  etymological:  'A linguistic or naming relationship — roots, synonyms, or aliases.',
+  positional:    'A role, occupation, or institutional affiliation.',
+  implication:   'A logical or practical consequence — one concept requires or enables the other.',
+  misconception: 'A common confusion or false equivalence between these two concepts.',
+  analogy:       'A structural parallel — these concepts mirror each other across different domains.',
+  influence:     'One shaped the development, thinking, or direction of the other.',
+  application:   'One concept is applied within or underlies the other.',
+  semantic:      'These articles are conceptually similar based on their content and context.',
+};
+
 function showEdgePanel(d) {
   const srcId = typeof d.source==='object' ? d.source.id : d.source;
   const tgtId = typeof d.target==='object' ? d.target.id : d.target;
   const src   = rawNodes[srcId] || {title:srcId};
   const tgt   = rawNodes[tgtId] || {title:tgtId};
   const ec    = EDGE_COLOR[d.type] || '#4a4a88';
+  const isSemantic = d._src === 'embedding_similarity';
+  const simPct = isSemantic ? Math.round((d.weight || 0) * 100) : null;
 
+  $('study-tabs').classList.add('hidden');
   setPanelHeader('Connection', null, null);
+
+  const sourceLine = isSemantic
+    ? `<div class="pe-sim-wrap">
+         <div class="pe-sim-bar-bg"><div class="pe-sim-bar-fill" style="width:${simPct}%;background:${ec}"></div></div>
+         <span class="pe-sim-label" style="color:${ec}">${simPct}% semantic similarity</span>
+       </div>`
+    : d.source_sentence
+      ? `<div class="pe-sentence ai">"${esc(d.source_sentence)}"</div>`
+      : `<div class="pe-sentence">No source sentence recorded for this edge.</div>`;
+
+  const familyDesc = EDGE_DESC[d.type] || '';
+
+  // If both ends are classified, offer study buttons
+  const srcStudy = rawNodes[srcId]?.classified
+    ? `<button class="pe-study-btn" data-action="peStudy" data-title="${esc(src.title)}" style="border-color:${domainColor(src.primary_domain)}55">Study ${esc(src.title)} →</button>`
+    : '';
+  const tgtStudy = rawNodes[tgtId]?.classified
+    ? `<button class="pe-study-btn" data-action="peStudy" data-title="${esc(tgt.title)}" style="border-color:${domainColor(tgt.primary_domain)}55">Study ${esc(tgt.title)} →</button>`
+    : '';
 
   setHTML($('pc-node'), `
     <div class="pe-nodes">
-      <div class="pe-node-nm" style="border-color:${domainColor(src.primary_domain)}44">${esc(src.title)}</div>
+      <div class="pe-node-nm" style="border-color:${domainColor(src.primary_domain)}55">
+        ${src.primary_domain ? `<span class="pe-domain-dot" style="background:${domainColor(src.primary_domain)}"></span>` : ''}
+        ${esc(src.title)}
+      </div>
       <div class="pe-arrow">
         <div class="pe-predicate" style="color:${ec}">${esc(d.predicate)}</div>
-        <div style="font-size:20px;color:var(--border2);margin:2px 0">↓</div>
+        <div class="pe-arrow-line" style="border-color:${ec}66"></div>
       </div>
-      <div class="pe-node-nm" style="border-color:${domainColor(tgt.primary_domain)}44">${esc(tgt.title)}</div>
+      <div class="pe-node-nm" style="border-color:${domainColor(tgt.primary_domain)}55">
+        ${tgt.primary_domain ? `<span class="pe-domain-dot" style="background:${domainColor(tgt.primary_domain)}"></span>` : ''}
+        ${esc(tgt.title)}
+      </div>
     </div>
-    ${d.source_sentence
-      ? `<div class="pe-sentence ai">"${esc(d.source_sentence)}"</div>`
-      : `<div class="pe-sentence">No source sentence for this edge.</div>`
-    }
-    ${ndRow('edge type', d.type||'–')}
-    ${ndRow('source',    d._src==='ai_inference' ? 'AI inference' : 'Wikipedia link')}
-    ${ndRow('weight',    d.weight!=null ? d.weight.toFixed(1) : '–')}
-    <div style="margin-top:8px">
-      <span style="font-family:var(--mono);font-size:8px;color:${ec};border:1px solid ${ec}44;padding:2px 7px;letter-spacing:1px;text-transform:uppercase">${esc(d.type||'unknown')}</span>
-    </div>
+
+    ${sourceLine}
+
+    ${familyDesc ? `<div class="pe-family-desc">${esc(familyDesc)}</div>` : ''}
+
+    ${ndRow('edge family',  d.type||'–')}
+    ${ndRow('source',       isSemantic ? 'Embedding similarity' : 'AI inference')}
+    ${ndRow('weight',       d.weight!=null ? d.weight.toFixed(isSemantic ? 3 : 1) : '–')}
+
+    <div class="pe-type-badge" style="color:${ec};border-color:${ec}44">${esc(d.type||'unknown')}</div>
+
+    ${(srcStudy || tgtStudy) ? `<div class="pe-study-row">${srcStudy}${tgtStudy}</div>` : ''}
   `);
 
   showPC('pc-node');
   openPanel('node');
 }
+
+// Delegate study buttons inside the edge panel
+document.addEventListener('click', e => {
+  const btn = e.target.closest('[data-action="peStudy"]');
+  if (btn) startStudyForTitle(btn.dataset.title);
+});
 
 /* ──────────────────────────────────────────────
    ARTICLE PANEL (unclassified Wikipedia article)
@@ -759,7 +1364,7 @@ async function showArticleForTitle(title) {
       <div class="art-excerpt" style="color:var(--muted2)">${esc(e.message)}</div>
       <div class="art-ctas" style="margin-top:16px">
         <a class="btn-cta-secondary" style="text-decoration:none;display:block;text-align:center;padding:9px 14px"
-           href="https:
+           href="https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g,'_'))}"
            target="_blank" rel="noopener">Open on Wikipedia ↗</a>
       </div>
     `);
@@ -769,7 +1374,7 @@ async function showArticleForTitle(title) {
   }
   setPS(title, PS.VIEWED);
 
-  const wikiUrl = `https:
+  const wikiUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(wiki.title.replace(/ /g,'_'))}`;
   setPanelHeader(wiki.title, null, wikiUrl);
 
   function splitAtBoundary(text, target=600) {
@@ -795,7 +1400,9 @@ async function showArticleForTitle(title) {
     <div class="art-full-text hidden" id="art-full-text">${esc(rest)}</div>` : ''}
     <div class="art-ctas">
       <button class="btn-cta-primary" id="btn-study-it">STUDY THIS ARTICLE →</button>
-      <button class="btn-cta-secondary" id="btn-graph-it">Classify for Map</button>
+      <button class="btn-cta-secondary" id="btn-graph-it"
+        ${rawNodes[wiki.title] ? 'disabled' : ''}
+      >${rawNodes[wiki.title] ? 'Already on map' : queuedTitles.has(wiki.title) ? 'Queued for map' : 'Classify for Map'}</button>
     </div>
     <hr class="art-sep">
     <div class="art-meta">
@@ -819,31 +1426,43 @@ async function showArticleForTitle(title) {
 
   $('btn-study-it').onclick = () => startStudyForWiki(wiki);
 
-  $('btn-graph-it').onclick = async () => {
-    const btn = $('btn-graph-it');
-    btn.disabled = true;
-    btn.textContent = 'Classifying…';
-    try {
-      const r = await fetch('/api/classify', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({title: wiki.title})
-      });
-      const data = await r.json();
-      if (r.ok) {
-        showToast(`${wiki.title} queued for the map`);
-        btn.textContent = 'Queued';
-      } else {
-        btn.disabled = false;
-        btn.textContent = 'Classify for Map';
-        showToast(data.error || 'Classification failed', 4000);
+  const graphBtn = $('btn-graph-it');
+  if (graphBtn && !graphBtn.disabled) {
+    graphBtn.onclick = async () => {
+      graphBtn.disabled = true;
+      graphBtn.textContent = 'Checking…';
+      try {
+        const r = await fetch('/api/classify', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({title: wiki.title})
+        });
+        const data = await r.json();
+        if (r.ok) {
+          if (data.status === 'already_classified') {
+            graphBtn.textContent = 'Already on map';
+            showToast(`${wiki.title} is already on the map`);
+          } else if (data.status === 'already_queued') {
+            queuedTitles.add(wiki.title);
+            graphBtn.textContent = 'Queued for map';
+            showToast(`${wiki.title} is already queued — check back soon`);
+          } else {
+            queuedTitles.add(wiki.title);
+            graphBtn.textContent = 'Queued for map';
+            showToast(`${wiki.title} queued — it will appear on the map shortly`);
+          }
+        } else {
+          graphBtn.disabled = false;
+          graphBtn.textContent = 'Classify for Map';
+          showToast(data.error || 'Classification failed', 4000);
+        }
+      } catch(e) {
+        graphBtn.disabled = false;
+        graphBtn.textContent = 'Classify for Map';
+        showToast('Network error', 4000);
       }
-    } catch(e) {
-      btn.disabled = false;
-      btn.textContent = 'Add to graph only';
-      showToast('Network error', 4000);
-    }
-  };
+    };
+  }
 
   const excEl = $('pc-article').querySelector('.art-excerpt');
   if (excEl) {
@@ -856,23 +1475,39 @@ async function showArticleForTitle(title) {
 }
 
 async function startStudyForTitle(title) {
-  
+  // 1. Check localStorage first (instant)
+  const local = loadCurriculumLocal(title);
+  if (local) {
+    state.topic = title;
+    state.wikiUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g,'_'))}`;
+    state.curriculum = local;
+    state.wikiText = '';
+    resetStudyState();
+    renderStudy();
+    renderLibrary();
+    return;
+  }
+
+  // 2. Check server (classified nodes may have stored curriculum)
   try {
     const r = await fetch(`${NODE_API}/${encodeURIComponent(title)}`);
     if (r.ok) {
       const data = await r.json();
       if (data.curriculum) {
+        saveCurriculumLocal(title, data.curriculum);
         state.topic = title;
         state.wikiUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g,'_'))}`;
         state.curriculum = data.curriculum;
         state.wikiText = '';
         resetStudyState();
         renderStudy();
+        renderLibrary();
         return;
       }
     }
   } catch {}
 
+  // 3. Generate fresh
   showPC('pc-loading');
   $('loading-msg').textContent = 'Fetching article…';
   setStep(1);
@@ -905,9 +1540,18 @@ async function startStudyForWiki(wiki) {
     const cur = await generateCurriculum(wiki.title, wiki.text);
     state.curriculum = cur;
     state.topic = cur.topic || wiki.title;
+    // Save to localStorage immediately
+    saveCurriculumLocal(state.topic, cur);
+    // Save to server (fire and forget)
+    fetch('/api/curriculum', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({title: state.topic, data: cur}),
+    }).catch(() => {});
     resetStudyState();
     setPS(wiki.title, PS.STUDIED);
     renderStudy();
+    renderLibrary();
   } catch(e) {
     showToast('Curriculum error: ' + e.message, 5000);
     closePanel();
@@ -969,6 +1613,7 @@ document.addEventListener('click', e => {
     case 'renderFlashcards':WD.renderFlashcards(); break;
     case 'rateCard':        WD.rateCard(target.dataset.knew==='1'); break;
     case 'flipCardFromNav': { const sc=document.querySelector('.fc-scene'); if(sc) WD.flipCard(sc); break; }
+    case 'openFromLibrary': startStudyForTitle(target.dataset.title); break;
   }
 });
 document.addEventListener('click', e => {
@@ -1261,9 +1906,12 @@ async function handleSearch(title) {
 ────────────────────────────────────────────── */
 async function handleRandom() {
   try {
-    const r = await fetch('/api/random');
+    const r = await fetch(
+      'https://en.wikipedia.org/w/api.php?action=query&list=random&rnnamespace=0&rnlimit=1&format=json&origin=*',
+      { signal: AbortSignal.timeout(8000) }
+    );
     const d = await r.json();
-    const title = d.title || (d.node && (d.node.title || d.node.id));
+    const title = d?.query?.random?.[0]?.title;
     if (!title) { showToast('Could not fetch random article', 3000); return; }
     await showArticleForTitle(title);
   } catch(e) {
@@ -1275,8 +1923,13 @@ async function handleRandom() {
    BOOT
 ────────────────────────────────────────────── */
 document.addEventListener('DOMContentLoaded', () => {
-  /* ── Panel close button ── */
-  $('btn-panel-back').addEventListener('click', closePanel);
+  /* ── Panel close / back-to-map buttons ── */
+  $('btn-panel-back').addEventListener('click', () => {
+    if (panelMode === 'pathfind') exitPathMode(); else closePanel();
+  });
+  $('btn-back-to-map')?.addEventListener('click', () => {
+    if (panelMode === 'pathfind') exitPathMode(); else closePanel();
+  });
 
   /* ── Search input ── */
   const inp = $('topic-input');
@@ -1301,6 +1954,43 @@ document.addEventListener('DOMContentLoaded', () => {
   /* ── Random button ── */
   $('btn-random').addEventListener('click', handleRandom);
 
+  /* ── Path Finder button ── */
+  $('btn-pathfind')?.addEventListener('click', openPathModal);
+
+  /* ── Path Finder modal ── */
+  $('pathfind-backdrop')?.addEventListener('click', closePathModal);
+  $('pathfind-close')?.addEventListener('click',   closePathModal);
+  $('btn-pf-go')?.addEventListener('click', startPathFind);
+  $('pf-from-input')?.addEventListener('keydown', e => { if (e.key === 'Enter') $('pf-to-input')?.focus(); });
+  $('pf-to-input')?.addEventListener('keydown',   e => { if (e.key === 'Enter') startPathFind(); });
+
+  /* ── Delegate: pfNodeClick — click node chip in path card ── */
+  document.addEventListener('click', e => {
+    const chip = e.target.closest('[data-action="pfNodeClick"]');
+    if (chip) {
+      const title = chip.dataset.title;
+      if (!title) return;
+      // In path mode: just highlight the node on the graph
+      if (pathMode) {
+        focusNode(title);
+        selectNode(title);
+        setTimeout(() => deselect(), 1800);
+      } else if (rawNodes[title]) {
+        focusNode(title);
+        selectNode(title);
+        showNodePanel(rawNodes[title]);
+      } else {
+        showArticleForTitle(title);
+      }
+    }
+  });
+
+  /* ── Escape key closes path modal ── */
+  document.addEventListener('keydown', e => {
+    const modal = $('pathfind-modal');
+    if (e.key === 'Escape' && modal && !modal.classList.contains('hidden')) closePathModal();
+  });
+
   /* ── Help modal ── */
   (function() {
     const modal   = $('help-modal');
@@ -1316,6 +2006,18 @@ document.addEventListener('DOMContentLoaded', () => {
         `<div class="hd-item">
           <span class="hd-swatch" style="background:${DOMAIN_COLOR[d]}"></span>
           <span>${d.charAt(0).toUpperCase()+d.slice(1)}</span>
+        </div>`
+      ).join('');
+    }
+
+    // Populate edge type legend (skip structural — internal only)
+    const edgeTypesEl = $('help-edge-types');
+    if (edgeTypesEl) {
+      const richTypes = Object.keys(EDGE_COLOR).filter(t => t !== 'structural');
+      edgeTypesEl.innerHTML = richTypes.map(t =>
+        `<div class="het-item">
+          <span class="het-swatch" style="background:${EDGE_COLOR[t]}"></span>
+          <span class="het-name">${t.charAt(0).toUpperCase()+t.slice(1)}</span>
         </div>`
       ).join('');
     }
@@ -1338,6 +2040,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   /* ── Boot graph ── */
   loadGraph().then(() => connectSSE());
+  renderLibrary();
+
+  /* ── Check for in-progress path session ── */
+  setTimeout(checkPathResume, 600);
 
   /* ── Load stats ── */
   fetch(STATS_API).then(r=>r.json()).then(d => {

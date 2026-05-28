@@ -1,7 +1,9 @@
 'use strict';
-const express = require('express');
-const cors    = require('cors');
+const express  = require('express');
+const cors     = require('cors');
 const { Pool } = require('pg');
+const { spawn } = require('child_process');
+const crypto   = require('crypto');
 require('dotenv').config();
 
 const app  = express();
@@ -353,10 +355,10 @@ app.post('/api/generate', rateLimit, async (req, res) => {
       headers: {
         'Content-Type':      'application/json',
         'x-api-key':         process.env.LLM_API_KEY,
-        'llm-version': '2023-06-01',
+        'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model:      process.env.MODEL || 'claude-sonnet-4-20250514',
+        model:      process.env.MODEL || 'claude-haiku-4-5-20251001',
         max_tokens: safeMaxTokens,
         system:     SYSTEM_PROMPT,
         messages:   [{ role: 'user', content: safeUser }],
@@ -388,16 +390,422 @@ app.post('/api/classify', rateLimit, async (req, res) => {
   }
   const clean = title.trim().slice(0, 300);
   try {
+    // Already fully classified — no point re-queuing
+    const nodeCheck = await pool.query(
+      'SELECT id FROM nodes WHERE id = $1 AND classified = true',
+      [clean]
+    );
+    if (nodeCheck.rowCount > 0) {
+      return res.status(200).json({ status: 'already_classified', title: clean });
+    }
+
+    // Already sitting in the queue
+    const frontierCheck = await pool.query(
+      'SELECT id FROM frontier WHERE id = $1',
+      [clean]
+    );
+    if (frontierCheck.rowCount > 0) {
+      return res.status(200).json({ status: 'already_queued', title: clean });
+    }
+
     await pool.query(
       `INSERT INTO frontier (id, title, added_at)
        VALUES ($1, $2, NOW())
        ON CONFLICT (id) DO NOTHING`,
       [clean, clean]
     );
-    return res.status(202).json({ queued: true, title: clean });
+    return res.status(202).json({ status: 'queued', title: clean });
   } catch (err) {
     console.error('/api/classify error:', err.message);
     return res.status(500).json({ error: 'Could not queue article' });
+  }
+});
+
+/* ── POST /api/curriculum ────────────────────────────────────────── *
+ * Stores a generated curriculum in the DB so it can be served later.
+ * ─────────────────────────────────────────────────────────────────── */
+app.post('/api/curriculum', rateLimit, async (req, res) => {
+  const { title, data } = req.body;
+  if (!title || typeof title !== 'string' || !data || typeof data !== 'object') {
+    return res.status(400).json({ error: 'Missing title or data' });
+  }
+  const clean = title.trim().slice(0, 300);
+  try {
+    await pool.query(
+      `INSERT INTO curricula (node_id, data, generated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (node_id) DO UPDATE SET data = EXCLUDED.data, generated_at = NOW()`,
+      [clean, JSON.stringify(data)]
+    );
+    return res.json({ saved: true });
+  } catch (err) {
+    console.error('/api/curriculum error:', err.message);
+    return res.status(500).json({ error: 'Could not save curriculum' });
+  }
+});
+
+/* ════════════════════════════════════════════════════════════════════
+   KNOWLEDGE PATH FINDER
+   ════════════════════════════════════════════════════════════════════ */
+
+const PIPELINE_PATH = process.env.PIPELINE_PATH || '/var/www/wikidactic/pipeline.py';
+
+/* Create pathfind_sessions table on startup */
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS pathfind_sessions (
+        id           TEXT PRIMARY KEY,
+        from_title   TEXT NOT NULL,
+        to_title     TEXT NOT NULL,
+        status       TEXT NOT NULL DEFAULT 'queued',
+        events       JSONB NOT NULL DEFAULT '[]',
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        started_at   TIMESTAMPTZ,
+        completed_at TIMESTAMPTZ
+      )
+    `);
+  } catch (e) {
+    console.error('pathfind_sessions table error:', e.message);
+  }
+})();
+
+/* Live SSE clients: sessionId -> Set<res> */
+const pathSseClients = new Map();
+
+/* Worker queue */
+const pathQueue = [];
+let pathWorkerRunning = false;
+
+/* Store event in DB and push to live SSE clients */
+async function pathEmit(sessionId, type, data) {
+  const ev = { type, data, ts: Date.now() };
+  try {
+    await pool.query(
+      `UPDATE pathfind_sessions SET events = events || $1::jsonb WHERE id = $2`,
+      [JSON.stringify([ev]), sessionId]
+    );
+  } catch (e) {
+    console.error('pathEmit DB error:', e.message);
+  }
+  const clients = pathSseClients.get(sessionId);
+  if (clients) {
+    const msg = `data: ${JSON.stringify({ type, ...data })}\n\n`;
+    for (const res of clients) { try { res.write(msg); } catch {} }
+  }
+}
+
+/* Spawn pipeline.py for a single article; resolves when classified */
+function classifyTitle(title) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      const check = await pool.query(
+        'SELECT id FROM nodes WHERE id = $1 AND classified = true', [title]
+      );
+      if (check.rowCount > 0) return resolve();
+    } catch {}
+
+    const proc = spawn('python3', [PIPELINE_PATH, title], { env: { ...process.env } });
+    let stderr = '';
+    proc.stderr.on('data', d => { stderr += d.toString(); });
+    proc.stdout.on('data', () => {});
+
+    const timer = setTimeout(() => { proc.kill('SIGTERM'); reject(new Error('timeout')); }, 90_000);
+    proc.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0)      resolve();
+      else if (code === 2) reject(new Error('article_not_found'));
+      else                 reject(new Error(`pipeline_exit_${code}`));
+    });
+    proc.on('error', e => { clearTimeout(timer); reject(e); });
+  });
+}
+
+/* Fetch Wikipedia links for a title (namespace 0 only) */
+async function wikiLinksOf(title) {
+  try {
+    const url = `https://en.wikipedia.org/w/api.php?action=query&prop=links&titles=${encodeURIComponent(title)}&pllimit=500&plnamespace=0&format=json&origin=*`;
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(8_000),
+      headers: { 'User-Agent': 'WikiFold/0.1 (knowledge graph)' },
+    });
+    const data = await res.json();
+    const pages = Object.values(data?.query?.pages || {});
+    return (pages[0]?.links || []).map(l => l.title);
+  } catch { return []; }
+}
+
+/* Wikipedia link-graph BFS: 1-2 hops max, returns path array or null */
+async function wikiStructuralPath(fromTitle, toTitle) {
+  if (fromTitle === toTitle) return [fromTitle];
+
+  const fromLinks = await wikiLinksOf(fromTitle);
+  if (fromLinks.includes(toTitle)) return [fromTitle, toTitle];
+
+  const candidates = fromLinks.slice(0, 60);
+  const results = await Promise.all(
+    candidates.map(async mid => {
+      try {
+        const midLinks = await wikiLinksOf(mid);
+        return midLinks.includes(toTitle) ? mid : null;
+      } catch { return null; }
+    })
+  );
+  const mid = results.find(r => r !== null);
+  if (mid) return [fromTitle, mid, toTitle];
+  return null;
+}
+
+/* Undirected BFS over a typed edge adjacency map */
+function bfsTyped(adj, start, end) {
+  if (!adj.has(start)) return null;
+  const visited = new Set([start]);
+  const queue   = [[start, [start], []]];
+
+  while (queue.length) {
+    const [curr, pathNodes, pathEdges] = queue.shift();
+    if (curr === end) return { nodes: pathNodes, edges: pathEdges };
+    for (const { to, edge } of (adj.get(curr) || [])) {
+      if (!visited.has(to)) {
+        visited.add(to);
+        queue.push([to, [...pathNodes, to], [...pathEdges, edge]]);
+      }
+    }
+  }
+  return null;
+}
+
+const PATH_FAMILIES = [
+  'interpersonal','geographical','temporal','categorical',
+  'etymological','positional','implication','misconception',
+  'analogy','influence','application','semantic',
+];
+
+/* Load all typed edges and BFS for each family */
+async function findTypedPaths(fromTitle, toTitle) {
+  const result = await pool.query(`
+    SELECT from_node, to_node, edge_type, predicate, weight, edge_source
+    FROM edges
+    WHERE edge_source IN ('ai_inference', 'embedding_similarity')
+  `);
+
+  const adjs = {};
+  for (const fam of PATH_FAMILIES) adjs[fam] = new Map();
+
+  for (const row of result.rows) {
+    const fam = row.edge_type;
+    if (!adjs[fam]) continue;
+    if (!adjs[fam].has(row.from_node)) adjs[fam].set(row.from_node, []);
+    adjs[fam].get(row.from_node).push({ to: row.to_node, edge: row });
+    if (!adjs[fam].has(row.to_node)) adjs[fam].set(row.to_node, []);
+    adjs[fam].get(row.to_node).push({ to: row.from_node, edge: row });
+  }
+
+  const paths = {};
+  for (const fam of PATH_FAMILIES) {
+    paths[fam] = bfsTyped(adjs[fam], fromTitle, toTitle);
+  }
+  return paths;
+}
+
+/* Main pathfind orchestrator */
+async function runPathfind(sessionId, fromTitle, toTitle) {
+  /* Step 1: classify both endpoints */
+  await pathEmit(sessionId, 'status', { msg: `Classifying "${fromTitle}"...` });
+  try {
+    await classifyTitle(fromTitle);
+    const nr = await pool.query('SELECT * FROM nodes WHERE id = $1', [fromTitle]);
+    await pathEmit(sessionId, 'node_ready', { node: nr.rows[0] || { id: fromTitle, title: fromTitle } });
+  } catch (e) {
+    await pathEmit(sessionId, 'warn', { msg: `Could not classify "${fromTitle}": ${e.message}` });
+  }
+
+  await pathEmit(sessionId, 'status', { msg: `Classifying "${toTitle}"...` });
+  try {
+    await classifyTitle(toTitle);
+    const nr = await pool.query('SELECT * FROM nodes WHERE id = $1', [toTitle]);
+    await pathEmit(sessionId, 'node_ready', { node: nr.rows[0] || { id: toTitle, title: toTitle } });
+  } catch (e) {
+    await pathEmit(sessionId, 'warn', { msg: `Could not classify "${toTitle}": ${e.message}` });
+  }
+
+  /* Step 2: typed paths (fast DB BFS) */
+  await pathEmit(sessionId, 'status', { msg: 'Searching typed relationship paths...' });
+  let foundCount = 0;
+  try {
+    const typedPaths = await findTypedPaths(fromTitle, toTitle);
+    for (const [pathType, path] of Object.entries(typedPaths)) {
+      if (path) {
+        await pathEmit(sessionId, 'path_found', { path_type: pathType, nodes: path.nodes, edges: path.edges });
+        foundCount++;
+      }
+    }
+  } catch (e) {
+    await pathEmit(sessionId, 'warn', { msg: `Typed path search error: ${e.message}` });
+  }
+
+  /* Step 3: structural path via Wikipedia link BFS */
+  await pathEmit(sessionId, 'status', { msg: 'Searching Wikipedia link structure...' });
+  try {
+    const structPath = await wikiStructuralPath(fromTitle, toTitle);
+    if (structPath) {
+      for (const title of structPath.slice(1, -1)) {
+        try {
+          await classifyTitle(title);
+          const nr = await pool.query('SELECT * FROM nodes WHERE id = $1', [title]);
+          await pathEmit(sessionId, 'node_ready', { node: nr.rows[0] || { id: title, title } });
+        } catch {}
+      }
+      await pathEmit(sessionId, 'path_found', { path_type: 'structural', nodes: structPath, edges: [] });
+      foundCount++;
+    }
+  } catch (e) {
+    await pathEmit(sessionId, 'warn', { msg: `Structural path error: ${e.message}` });
+  }
+
+  await pathEmit(sessionId, 'complete', { found: foundCount, from: fromTitle, to: toTitle });
+}
+
+/* Worker: pulls one session from queue and runs it */
+async function startPathWorker() {
+  if (pathWorkerRunning || !pathQueue.length) return;
+  pathWorkerRunning = true;
+  const sessionId = pathQueue.shift();
+
+  try {
+    const sess = await pool.query('SELECT * FROM pathfind_sessions WHERE id = $1', [sessionId]);
+    if (!sess.rowCount) { pathWorkerRunning = false; return; }
+    const { from_title, to_title } = sess.rows[0];
+
+    await pool.query(
+      `UPDATE pathfind_sessions SET status = 'running', started_at = NOW() WHERE id = $1`,
+      [sessionId]
+    );
+    await runPathfind(sessionId, from_title, to_title);
+    await pool.query(
+      `UPDATE pathfind_sessions SET status = 'complete', completed_at = NOW() WHERE id = $1`,
+      [sessionId]
+    );
+  } catch (err) {
+    console.error('Pathfind worker error:', err.message);
+    try {
+      await pathEmit(sessionId, 'error', { message: err.message });
+      await pool.query(`UPDATE pathfind_sessions SET status = 'error' WHERE id = $1`, [sessionId]);
+    } catch {}
+  } finally {
+    pathWorkerRunning = false;
+    if (pathQueue.length) setTimeout(startPathWorker, 50);
+  }
+}
+
+/* On restart: re-queue any sessions that were 'running' (they stalled) */
+(async () => {
+  try {
+    const stalled = await pool.query(
+      `UPDATE pathfind_sessions SET status = 'queued', started_at = NULL
+       WHERE status IN ('running', 'queued')
+       RETURNING id`
+    );
+    for (const row of stalled.rows) {
+      pathQueue.push(row.id);
+    }
+    if (pathQueue.length) setTimeout(startPathWorker, 2000);
+  } catch {}
+})();
+
+/* ── POST /api/pathfind ───────────────────────────────────────────── */
+app.post('/api/pathfind', rateLimit, async (req, res) => {
+  const { from, to } = req.body;
+  if (!from || !to || typeof from !== 'string' || typeof to !== 'string') {
+    return res.status(400).json({ error: 'from and to required' });
+  }
+  const cleanFrom = from.trim().slice(0, 300);
+  const cleanTo   = to.trim().slice(0, 300);
+  if (!cleanFrom || !cleanTo) return res.status(400).json({ error: 'Invalid titles' });
+  if (cleanFrom === cleanTo)  return res.status(400).json({ error: 'from and to must differ' });
+
+  try {
+    const sessionId = crypto.randomBytes(12).toString('hex');
+    await pool.query(
+      `INSERT INTO pathfind_sessions (id, from_title, to_title) VALUES ($1, $2, $3)`,
+      [sessionId, cleanFrom, cleanTo]
+    );
+
+    const aheadRes = await pool.query(
+      `SELECT COUNT(*) FROM pathfind_sessions
+       WHERE status IN ('queued','running') AND id != $1`,
+      [sessionId]
+    );
+    const ahead = parseInt(aheadRes.rows[0].count, 10);
+
+    pathQueue.push(sessionId);
+    setTimeout(startPathWorker, 10);
+
+    res.json({ sessionId, ahead, from: cleanFrom, to: cleanTo });
+  } catch (err) {
+    console.error('/api/pathfind error:', err.message);
+    res.status(500).json({ error: 'Could not create path session' });
+  }
+});
+
+/* ── GET /api/pathfind/stream/:sessionId ─────────────────────────── */
+app.get('/api/pathfind/stream/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || !/^[0-9a-f]{24}$/.test(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session ID' });
+  }
+
+  try {
+    const sess = await pool.query(
+      'SELECT events FROM pathfind_sessions WHERE id = $1', [sessionId]
+    );
+    if (!sess.rowCount) return res.status(404).json({ error: 'Session not found' });
+
+    res.setHeader('Content-Type',  'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection',    'keep-alive');
+    res.setHeader('Content-Security-Policy', "default-src 'none'");
+    res.flushHeaders();
+    res.write(': connected\n\n');
+
+    /* Replay stored events */
+    for (const ev of (sess.rows[0].events || [])) {
+      res.write(`data: ${JSON.stringify({ type: ev.type, ...ev.data })}\n\n`);
+    }
+
+    /* Register as live client */
+    if (!pathSseClients.has(sessionId)) pathSseClients.set(sessionId, new Set());
+    pathSseClients.get(sessionId).add(res);
+
+    const ping = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 20_000);
+    req.on('close', () => {
+      clearInterval(ping);
+      const set = pathSseClients.get(sessionId);
+      if (set) { set.delete(res); if (!set.size) pathSseClients.delete(sessionId); }
+    });
+  } catch (err) {
+    console.error('/api/pathfind/stream error:', err.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Stream error' });
+  }
+});
+
+/* ── GET /api/pathfind/status/:sessionId ─────────────────────────── */
+app.get('/api/pathfind/status/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  if (!sessionId || !/^[0-9a-f]{24}$/.test(sessionId)) {
+    return res.status(400).json({ error: 'Invalid session ID' });
+  }
+  try {
+    const result = await pool.query(
+      `SELECT id, from_title, to_title, status, created_at, started_at, completed_at
+       FROM pathfind_sessions WHERE id = $1`,
+      [sessionId]
+    );
+    if (!result.rowCount) return res.status(404).json({ error: 'Session not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error('/api/pathfind/status error:', err.message);
+    res.status(500).json({ error: 'DB error' });
   }
 });
 

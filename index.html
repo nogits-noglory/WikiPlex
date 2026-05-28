@@ -7,7 +7,7 @@
 <title>WikiDactic: Leave Wikipedia Smarter</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;700;900&family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="css/style.css?v=20">
+<link rel="stylesheet" href="css/style.css?v=32">
 </head>
 <body>
 
@@ -24,6 +24,7 @@
       <div id="ac-dropdown" class="ac-dropdown"></div>
     </div>
     <button id="btn-random" class="btn-random" title="Random article">⚄ RANDOM</button>
+    <button id="btn-pathfind" class="btn-pathfind" title="Find path between two articles">⟷ PATH</button>
     <div id="hud-meta">
       <span id="hud-stats">
         <strong id="stat-nodes">–</strong> nodes ·
@@ -36,6 +37,12 @@
   </div>
   <div id="input-error" class="error-inline hidden"></div>
 </header>
+
+<div id="path-resume-banner" class="path-resume-banner hidden">
+  <span class="path-resume-msg">Path session in progress</span>
+  <button class="btn-resume-path">RESUME</button>
+  <button class="btn-dismiss-resume" title="Dismiss">&#x2715;</button>
+</div>
 
 <aside id="detail-panel">
 
@@ -72,6 +79,7 @@
           <div class="leg-row"><span class="leg-swatch studied"></span><span>Studied</span></div>
           <div class="leg-row"><span class="leg-swatch conquered"></span><span>Conquered ★</span></div>
         </div>
+        <div class="idle-library" id="idle-library"></div>
       </div>
     </div>
 
@@ -100,6 +108,8 @@
       <section id="panel-resources"  class="panel hidden"></section>
     </div>
 
+    <div id="pc-pathfind" class="pc hidden"></div>
+
   </div>
 </aside>
 
@@ -122,6 +132,8 @@
     </a>
   </div>
 </div>
+
+<button id="btn-back-to-map" class="btn-back-to-map hidden" title="Back to map">← MAP</button>
 
 <button id="btn-help" class="btn-help" title="Field Guide: how to use WikiDactic">?</button>
 
@@ -158,6 +170,8 @@
         <div class="help-domains" id="help-domains">
 
         </div>
+        <div class="help-col-title" style="margin-top:20px">◈ Edge Types</div>
+        <div class="help-edge-types" id="help-edge-types"></div>
       </div>
     </div>
     <div class="help-footer">
@@ -166,8 +180,35 @@
   </div>
 </div>
 
+<!-- Path Finder Modal -->
+<div id="pathfind-modal" class="pathfind-modal hidden" role="dialog" aria-modal="true" aria-label="Knowledge Path Finder">
+  <div class="pathfind-backdrop" id="pathfind-backdrop"></div>
+  <div class="pathfind-box">
+    <div class="pathfind-header">
+      <span class="pathfind-title">// Knowledge Path Finder //</span>
+      <button id="pathfind-close" class="pathfind-close" title="Close">&#x2715;</button>
+    </div>
+    <div class="pathfind-inputs">
+      <div class="pf-input-group">
+        <div class="pf-input-label">From</div>
+        <input type="text" id="pf-from-input" class="pf-input"
+               placeholder="Start article..." autocomplete="off" spellcheck="false" maxlength="200">
+        <div id="pf-from-ac" class="pf-ac-dropdown"></div>
+      </div>
+      <div class="pf-divider">&#8595;</div>
+      <div class="pf-input-group">
+        <div class="pf-input-label">To</div>
+        <input type="text" id="pf-to-input" class="pf-input"
+               placeholder="End article..." autocomplete="off" spellcheck="false" maxlength="200">
+        <div id="pf-to-ac" class="pf-ac-dropdown"></div>
+      </div>
+    </div>
+    <button id="btn-pf-go" class="btn-pathfind-go">FIND PATH</button>
+  </div>
+</div>
+
 <script nonce="__CSP_NONCE__" src="js/d3.v7.min.js"></script>
 <script nonce="__CSP_NONCE__" src="js/purify.min.js"></script>
-<script nonce="__CSP_NONCE__" src="js/app.js?v=20"></script>
+<script nonce="__CSP_NONCE__" src="js/app.js?v=32"></script>
 </body>
 </html>

@@ -3,10 +3,12 @@
 WikiFold - Classification Pipeline
 Usage:  python pipeline.py "French Revolution"
         python pipeline.py --random
-        python pipeline.py              (interactive)
+        python pipeline.py --worker           (drain frontier queue, batch of 5)
+        python pipeline.py --worker --batch=10
+        python pipeline.py                    (interactive)
 
-Requires: pip install requests requests python-dotenv psycopg2-binary
-Outputs:  PostgreSQL (primary) + graph.json (local backup) + curricula/
+Requires: pip install requests python-dotenv psycopg2-binary
+Optional: pip install sentence-transformers numpy  (enables semantic similarity edges)
 """
 
 import os
@@ -19,13 +21,32 @@ from pathlib import Path
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-# Optional DB import — pipeline works without it (writes graph.json only)
+# Optional DB import
 try:
     import psycopg2
     from psycopg2.extras import Json as PgJson
     PG_AVAILABLE = True
 except ImportError:
     PG_AVAILABLE = False
+
+# Optional embedding imports (lazy-loaded on first use)
+_embed_model  = None
+_EMBED_CHECKED = False
+
+def _get_embed_model():
+    """Lazy-load sentence-transformers on first call. Returns model or None."""
+    global _embed_model, _EMBED_CHECKED
+    if _EMBED_CHECKED:
+        return _embed_model
+    _EMBED_CHECKED = True
+    try:
+        from sentence_transformers import SentenceTransformer
+        _embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+        ok("Embedding model loaded: all-MiniLM-L6-v2 (384-dim)")
+    except Exception as e:
+        warn(f"sentence-transformers not available — semantic edges disabled. ({e})")
+        _embed_model = None
+    return _embed_model
 
 # --- Setup ---
 BASE_DIR       = Path(__file__).parent
@@ -37,6 +58,22 @@ load_dotenv(BASE_DIR / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost/wikifold")
 
+# --- Colors ---
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+GOLD   = "\033[33m"
+CYAN   = "\033[36m"
+GREEN  = "\033[32m"
+RED    = "\033[31m"
+SILVER = "\033[37m"
+
+def log(msg, color=SILVER): print(f"{color}{msg}{RESET}")
+def ok(msg):                 print(f"{GREEN}  + {msg}{RESET}")
+def warn(msg):               print(f"{GOLD}  ! {msg}{RESET}")
+def err(msg):                print(f"{RED}  x {msg}{RESET}")
+def dim(msg):                print(f"{DIM}    {msg}{RESET}")
+
 # --- DB helpers ---
 def get_db_conn():
     if not PG_AVAILABLE:
@@ -47,8 +84,21 @@ def get_db_conn():
         warn(f"DB connection failed: {e}. Writing graph.json only.")
         return None
 
+def ensure_embeddings_table(conn):
+    if conn is None:
+        return
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS embeddings (
+            node_id    TEXT PRIMARY KEY,
+            vector     JSONB NOT NULL,
+            model_name TEXT DEFAULT 'all-MiniLM-L6-v2',
+            generated_at TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.close()
+
 def db_write_node(conn, node: dict):
-    """Upsert a classified node into Postgres."""
     if conn is None:
         return
     cur = conn.cursor()
@@ -102,7 +152,6 @@ def db_write_node(conn, node: dict):
         node.get("nav_style_signal"), node.get("gap_assessment"),
         node.get("visited_at"),
     ))
-    # Remove from frontier if it was there
     cur.execute("DELETE FROM frontier WHERE id = %s", (node["id"],))
     cur.close()
 
@@ -158,28 +207,88 @@ def db_emit_event(conn, event_type: str, node_id: str, payload: dict):
     """, (event_type, node_id, PgJson(payload)))
     cur.close()
 
-API_KEY = os.getenv("LLM_API_KEY")
-MODEL   = os.getenv("MODEL", "claude-sonnet-4-20250514")
+def db_write_embedding(conn, node_id: str, vector: list):
+    if conn is None or not vector:
+        return
+    ensure_embeddings_table(conn)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO embeddings (node_id, vector, model_name, generated_at)
+        VALUES (%s, %s, 'all-MiniLM-L6-v2', NOW())
+        ON CONFLICT (node_id) DO UPDATE SET
+            vector       = EXCLUDED.vector,
+            model_name   = EXCLUDED.model_name,
+            generated_at = NOW()
+    """, (node_id, PgJson(vector)))
+    cur.close()
 
-if not API_KEY:
-    print("\n  ERROR: LLM_API_KEY not found in .env\n")
-    sys.exit(1)
+def find_semantic_neighbors(conn, title: str, vector: list, top_k: int = 5, threshold: float = 0.72) -> list:
+    """
+    Load all stored embeddings and return top-K most similar nodes
+    (cosine similarity, numpy). Returns list of (node_id, similarity_score).
+    """
+    if conn is None or not vector:
+        return []
+    try:
+        import numpy as np
+    except ImportError:
+        return []
 
-# --- Colors ---
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-GOLD   = "\033[33m"
-CYAN   = "\033[36m"
-GREEN  = "\033[32m"
-RED    = "\033[31m"
-SILVER = "\033[37m"
+    try:
+        ensure_embeddings_table(conn)
+        cur = conn.cursor()
+        cur.execute("SELECT node_id, vector FROM embeddings WHERE node_id != %s", (title,))
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        warn(f"Embedding lookup failed: {e}")
+        return []
 
-def log(msg, color=SILVER):   print(f"{color}{msg}{RESET}")
-def ok(msg):                   print(f"{GREEN}  ✓ {msg}{RESET}")
-def warn(msg):                 print(f"{GOLD}  ⚠ {msg}{RESET}")
-def err(msg):                  print(f"{RED}  ✗ {msg}{RESET}")
-def dim(msg):                  print(f"{DIM}    {msg}{RESET}")
+    if not rows:
+        return []
+
+    q = np.array(vector, dtype=np.float32)
+    q_norm = float(np.linalg.norm(q))
+    if q_norm < 1e-9:
+        return []
+
+    results = []
+    for node_id, stored in rows:
+        if stored is None:
+            continue
+        stored_list = stored if isinstance(stored, list) else list(stored)
+        v = np.array(stored_list, dtype=np.float32)
+        v_norm = float(np.linalg.norm(v))
+        if v_norm < 1e-9:
+            continue
+        sim = float(np.dot(q, v) / (q_norm * v_norm))
+        if sim >= threshold:
+            results.append((node_id, round(sim, 4)))
+
+    results.sort(key=lambda x: -x[1])
+    return results[:top_k]
+
+def generate_embedding(node: dict) -> list | None:
+    """Generate a semantic embedding from node metadata text."""
+    model = _get_embed_model()
+    if model is None:
+        return None
+    parts = [node.get("title") or ""]
+    if node.get("curiosity_hook"):
+        parts.append(node["curiosity_hook"])
+    if node.get("primary_domain"):
+        parts.append(f"Domain: {node['primary_domain']}")
+    if node.get("related_concepts"):
+        parts.append("Related: " + ", ".join(node["related_concepts"][:8]))
+    if node.get("gap_assessment"):
+        parts.append(node["gap_assessment"][:200])
+    text = ". ".join(p for p in parts if p)
+    try:
+        vec = model.encode(text)
+        return vec.tolist()
+    except Exception as e:
+        warn(f"Embedding generation failed: {e}")
+        return None
 
 # --- Graph store ---
 def load_graph() -> dict:
@@ -232,7 +341,6 @@ def fetch_wikipedia(title: str) -> dict:
     if len(article_text) < 100:
         raise ValueError(f'Article "{title}" is too short to classify')
 
-    # Truncate to ~10000 chars to stay within token budget
     truncated = article_text[:10000] + "\n[article truncated]" \
         if len(article_text) > 10000 else article_text
 
@@ -246,7 +354,7 @@ def fetch_wikipedia(title: str) -> dict:
         "word_count":     word_count,
     }
 
-# --- Preclassifier ---─
+# --- Preclassifier ---
 def preclassify(title: str, text: str, word_count: int) -> dict:
     is_list  = bool(re.match(r"^(list of|index of|outline of|glossary of)", title, re.I))
     is_stub  = word_count < 150
@@ -265,16 +373,16 @@ def build_prompt(title: str, text: str, outbound_links: list) -> tuple[str, str]
     system = (
         "You are WikiFold's knowledge engine. You read Wikipedia articles and return a single, "
         "precise JSON object. You never return markdown fences, preamble, or trailing text. "
-        "You never hallucinate facts. Every claim you make must be supportable from the article "
-        "text provided. If the article does not contain enough information to answer a field "
-        "confidently, you use null rather than guessing."
+        "You never hallucinate facts. Every claim must be supportable from the article text. "
+        "If the article does not contain enough information to answer a field confidently, "
+        "use null rather than guessing."
     )
 
     user = f"""Analyze this Wikipedia article and return a single JSON object with three top-level keys: "classification", "triples", and "curriculum".
 
 ARTICLE TITLE: {title}
 
-OUTBOUND LINKS (these are the Wikipedia articles this article links to):
+OUTBOUND LINKS (articles this article links to):
 {link_list}
 
 ARTICLE TEXT:
@@ -292,18 +400,18 @@ Return exactly this structure:
     "shareability_score": 0,
     "weird_factor": 0,
     "curriculum_worthy": true,
-    "curiosity_hook": "One sentence. The single most interesting, surprising, or strange thing about this subject. Write it as a fact, not a tease.",
+    "curiosity_hook": "One sentence. The single most interesting, surprising, or strange fact about this subject. Write it as a fact, not a tease.",
     "primary_domain": "Single string. Choose from: mathematics, physics, chemistry, biology, medicine, psychology, philosophy, linguistics, history, politics, economics, law, technology, computing, engineering, art, literature, music, film, religion, mythology, geography, anthropology, sociology, sports, food, other",
     "domains": ["Array of all applicable domains from the list above"],
     "era": "ancient | medieval | early_modern | modern | contemporary | timeless",
     "primary_geography": "Single most relevant country or region, or null",
     "geography": ["Array of all relevant countries or regions"],
     "key_figures": ["Names of people central to this article"],
-    "linguistic_root": "The etymological origin of the article subject name, or null. Example: Greek: arithmos, meaning number",
+    "linguistic_root": "Etymological origin of the subject name, or null. Example: Greek: arithmos, meaning number",
     "related_concepts": ["3 to 6 concepts closely related to this subject that may not be directly linked"],
     "disambiguation_risks": ["Terms or concepts this subject is commonly confused with"],
     "nav_style_signal": "conceptual | biographical | geographical | chronological",
-    "gap_assessment": "One paragraph describing what important context, perspectives, or information is absent from this Wikipedia article. Be specific. Null if the article is comprehensive."
+    "gap_assessment": "One paragraph describing what important context or information is absent from this Wikipedia article. Null if comprehensive."
   }},
 
   "triples": [
@@ -314,13 +422,13 @@ Return exactly this structure:
       "object_is_link": true,
       "object_wiki_title": "Exact Wikipedia article title if object_is_link is true, else null",
       "source_sentence": "The exact sentence from the article that supports this triple",
-      "edge_type": "interpersonal | geographical | temporal | categorical | etymological | positional"
+      "edge_type": "interpersonal | geographical | temporal | categorical | etymological | positional | implication | misconception | analogy"
     }}
   ],
 
   "curriculum": {{
-    "summary": "2 to 3 sentence overview of the subject suitable for a student encountering it for the first time",
-    "gaps": ["Important concepts or context MISSING from the Wikipedia article that a student would need. Be specific. Empty array if none."],
+    "summary": "2 to 3 sentence overview suitable for a student encountering this for the first time",
+    "gaps": ["Important concepts MISSING from the Wikipedia article that a student would need. Empty array if none."],
     "dictionary": [
       {{ "term": "Key term", "definition": "Clear concise definition", "fromWiki": true }}
     ],
@@ -351,25 +459,47 @@ Return exactly this structure:
 }}
 
 RULES FOR classification:
-- article_type: "canonical" if depth_score >= 7 and the article has substantial content. "curiosity" if depth_score 4-6 or weird_factor >= 7. "stub" if very short or highly obscure. "list" if primarily a list.
-- depth_score: 0-10. Score conceptual richness, sourcing quality, and educational value.
+- article_type: "canonical" if depth_score >= 7 and substantial content. "curiosity" if depth_score 4-6 or weird_factor >= 7. "stub" if very short. "list" if primarily a list.
+- depth_score: 0-10. Conceptual richness, sourcing quality, educational value.
 - shareability_score: 0-10. How likely someone is to share this.
-- weird_factor: 0-10. How surprising, strange, or counterintuitive the subject is.
+- weird_factor: 0-10. How surprising or counterintuitive the subject is.
 - curiosity_hook: Must be a genuine fact. Bad: "This covers an important event." Good: "The Great Molasses Flood of 1919 moved at 35 mph, killing 21 people."
-- nav_style_signal: How would most people navigate away? biographical/geographical/chronological/conceptual.
+- nav_style_signal: How would most people navigate away?
 - era: Use "timeless" for mathematics, logic, natural laws.
 
 RULES FOR triples:
-- Extract 6 to 15 triples. Every triple must include source_sentence copied exactly from the text.
+- Extract 8 to 18 triples. Every triple must include source_sentence copied exactly from the text.
 - object_is_link must be true only if the object appears in the outbound links list above.
+- Never emit a triple where subject and object are the same article.
 - Use ONLY these predicates:
+
   INTERPERSONAL: married to, parent of, child of, sibling of, allied with, opposed by, mentored by, collaborated with, succeeded by, preceded by as leader
-  POSITIONAL: served as, founded, led, member of, employed by, created, invented, authored, directed
-  GEOGRAPHICAL: born in, died in, located in, originated in, conquered, invaded, capital of
-  TEMPORAL: occurred during, caused by, resulted in, contemporaneous with
-  CATEGORICAL: type of, subfield of, instance of, part of, used in
+  POSITIONAL: served as, founded, led, member of, employed by, created, invented, authored, directed, plays, plays as, competes in, written in
+  GEOGRAPHICAL: born in, died in, located in, originated in, conquered, invaded, capital of, broadcast in
+  TEMPORAL: occurred during, caused by, resulted in, contemporaneous with, preceded by, succeeded by
+  CATEGORICAL: type of, subfield of, instance of, part of, used in, plays in, produces
   ETYMOLOGICAL: derived from, root meaning, synonym of, antonym of, also known as
+  IMPLICATION: implies, is prerequisite for, enables, contradicts, historically led to, challenged by
+  MISCONCEPTION: commonly confused with, often mistaken for, is not the same as, was historically misattributed to
+  ANALOGY: is analogous to, parallels, is the [domain] equivalent of
+  INFLUENCE: influenced, was inspired by, gave rise to, is a precursor of, shaped the development of
+  APPLICATION: is applied in, enables the study of, has applications in, underlies, is used to solve
+
+- edge_type must match the predicate family above.
 - Do not duplicate triples.
+
+CRITICAL predicate rules — these are the most common errors, avoid them:
+- A PERSON is never "type of" a sport, discipline, or role. Use POSITIONAL instead.
+  WRONG: {{ "subject": "Paolo DelPiccolo", "predicate": "type of", "object": "Association football" }}
+  RIGHT: {{ "subject": "Paolo DelPiccolo", "predicate": "plays", "object": "Association football", "edge_type": "positional" }}
+- A SPORTS CLUB is never "type of" a sport. Use CATEGORICAL "competes in" or "plays in".
+  WRONG: {{ "subject": "G.D. Chaves", "predicate": "type of", "object": "Association football" }}
+  RIGHT: {{ "subject": "G.D. Chaves", "predicate": "competes in", "object": "Association football", "edge_type": "categorical" }}
+- A PUBLICATION is never "type of" a language. Use POSITIONAL "written in".
+  WRONG: {{ "subject": "Público", "predicate": "type of", "object": "Portuguese language" }}
+  RIGHT: {{ "subject": "Público", "predicate": "written in", "object": "Portuguese language", "edge_type": "positional" }}
+- INTERPERSONAL predicates are for relationships between people, not between organizations or events.
+- "type of" means ontological classification (Epidendrum is a type of Orchid). Do not use it for membership, participation, or language.
 
 RULES FOR curriculum:
 - dictionary: 8-14 entries. fromWiki false if term not in article but important.
@@ -392,12 +522,12 @@ def call_api(system: str, user: str) -> str:
         "https://api.anthropic.com/v1/messages",
         headers={
             "x-api-key":         API_KEY,
-            "llm-version": "2023-06-01",
+            "anthropic-version": "2023-06-01",
             "content-type":      "application/json",
         },
         json={
             "model":      MODEL,
-            "max_tokens": 6000,
+            "max_tokens": 8000,
             "system":     system,
             "messages":   [{"role": "user", "content": user}],
         },
@@ -433,6 +563,11 @@ def parse_response(raw: str) -> dict:
     if c.get("nav_style_signal") not in valid_nav:
         c["nav_style_signal"] = "conceptual"
 
+    valid_types_edge = {
+        "interpersonal", "geographical", "temporal", "categorical",
+        "etymological", "positional", "implication", "misconception",
+        "analogy", "influence", "application"
+    }
     if not isinstance(parsed["triples"], list):
         parsed["triples"] = []
 
@@ -440,6 +575,10 @@ def parse_response(raw: str) -> dict:
         t for t in parsed["triples"]
         if t.get("subject") and t.get("predicate") and t.get("object") and t.get("source_sentence")
     ]
+
+    for t in parsed["triples"]:
+        if t.get("edge_type") not in valid_types_edge:
+            t["edge_type"] = "categorical"
 
     if parsed["curriculum"].get("quiz"):
         for q in parsed["curriculum"]["quiz"]:
@@ -479,14 +618,6 @@ def extract_graph_updates(title: str, parsed: dict, outbound_links: list) -> tup
         "visited_at":          now,
     }
 
-    # All outbound links become frontier nodes and structural edges immediately.
-    # This is the base threading - the raw directed Wikipedia link graph.
-    # Inferred edges layer on top as enrichment.
-    frontier_updates = [
-        {"id": link, "title": link, "classified": False, "linked_from": title}
-        for link in outbound_links if link != title
-    ]
-
     structural_edges = [
         {
             "from":       title,
@@ -515,9 +646,15 @@ def extract_graph_updates(title: str, parsed: dict, outbound_links: list) -> tup
         if t.get("object_is_link") and t.get("object_wiki_title")
     ]
 
-    # Where an inferred edge exists for a link, use it instead of the bare structural one.
-    # Structural edges remain for all other outbound links.
+    # Only queue articles the LLM identified as meaningful relationships —
+    # not every outbound link. Classifying one article could have 500+ outbound
+    # links and most would be stubs, redirects, or disambiguation pages.
     inferred_targets = {e["to"] for e in inferred_edges}
+    frontier_updates = [
+        {"id": link, "title": link, "classified": False, "linked_from": title}
+        for link in inferred_targets if link != title
+    ]
+
     base_edges = [e for e in structural_edges if e["to"] not in inferred_targets]
     all_edges = base_edges + inferred_edges
 
@@ -540,12 +677,13 @@ def print_node(node: dict):
         log(f'  "{node["curiosity_hook"]}"', CYAN)
     print()
 
-def print_summary(graph: dict, node: dict, structural_edges: list, inferred_edges: list, frontier_updates: list):
+def print_summary(graph: dict, node: dict, structural_edges: list, inferred_edges: list, frontier_updates: list, semantic_edges: list):
     new_frontier = sum(1 for f in frontier_updates if f["id"] not in graph["nodes"])
     log("─" * 60, DIM)
     ok(f"Node classified:   {node['title']}")
-    ok(f"Structural edges:  {len(structural_edges)}  (Wikipedia links → frontier threading)")
+    ok(f"Structural edges:  {len(structural_edges)}")
     ok(f"Inferred edges:    {len(inferred_edges)}  (AI typed relationships)")
+    ok(f"Semantic edges:    {len(semantic_edges)}  (embedding similarity)")
     ok(f"Frontier added:    {new_frontier}")
     ok(f"Total nodes:       {len(graph['nodes'])}")
     ok(f"Total edges:       {len(graph['edges'])}")
@@ -555,14 +693,13 @@ def print_summary(graph: dict, node: dict, structural_edges: list, inferred_edge
 # --- Main pipeline ---
 def run(input_title: str):
     print()
-    log("╔══════════════════════════════════════════╗", GOLD)
-    log("║          WikiFold Pipeline v0.1          ║", GOLD)
-    log("╚══════════════════════════════════════════╝", GOLD)
+    log("+===========================================+", GOLD)
+    log("|          WikiFold Pipeline v0.2          |", GOLD)
+    log("+===========================================+", GOLD)
     print()
 
     graph = load_graph()
 
-    # Already classified?
     if graph["nodes"].get(input_title, {}).get("classified"):
         warn(f'"{input_title}" is already in the graph.')
         dim("Delete the node from graph.json to reclassify.")
@@ -573,7 +710,13 @@ def run(input_title: str):
     log(f'Fetching Wikipedia: "{input_title}"...', SILVER)
     try:
         wiki = fetch_wikipedia(input_title)
+    except ValueError as e:
+        # Permanent failure: article doesn't exist or is too short/stub —
+        # exit code 2 so drain_frontier removes it from the queue rather than retrying
+        err(str(e))
+        sys.exit(2)
     except Exception as e:
+        # Transient failure: network error, rate limit, etc — keep in queue for retry
         err(str(e))
         sys.exit(1)
     ok(f'Fetched "{wiki["title"]}" - {wiki["word_count"]} words, {len(wiki["outbound_links"])} outbound links')
@@ -613,7 +756,7 @@ def run(input_title: str):
     dim(f"Estimated prompt tokens: ~{token_estimate:,}")
 
     # Step 4: Classify
-    log("Classifying...", SILVER)
+    log("Classifying with LLM...", SILVER)
     start = time.time()
     try:
         raw = call_api(system, user)
@@ -634,15 +777,15 @@ def run(input_title: str):
         sys.exit(1)
     ok("Response parsed and validated")
 
-    # Step 6: Extract updates
+    # Step 6: Extract graph updates
     node, frontier_updates, all_edges = extract_graph_updates(
         wiki["title"], parsed, wiki["outbound_links"]
     )
 
-    inferred_edges = [e for e in all_edges if e["source"] == "ai_inference"]
+    inferred_edges   = [e for e in all_edges if e["source"] == "ai_inference"]
     structural_edges = [e for e in all_edges if e["source"] == "wikipedia_links"]
 
-    # Step 7: Save curriculum separately
+    # Step 7: Save curriculum to disk
     CURRICULA_DIR.mkdir(exist_ok=True)
     safe_name = re.sub(r"[^a-z0-9]", "_", wiki["title"], flags=re.I)
     curriculum_path = CURRICULA_DIR / f"{safe_name}.json"
@@ -654,16 +797,14 @@ def run(input_title: str):
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     ok(f"Curriculum saved: curricula/{safe_name}.json")
 
-    # Step 8: Update graph
+    # Step 8: Update graph.json
     graph["nodes"][wiki["title"]] = node
 
     for f in frontier_updates:
         if f["id"] not in graph["nodes"] and f["id"] not in graph["frontier"]:
             graph["frontier"][f["id"]] = f
 
-    existing_edge_keys = {
-        (e["from"], e["to"], e["type"]) for e in graph["edges"]
-    }
+    existing_edge_keys = {(e["from"], e["to"], e["type"]) for e in graph["edges"]}
     for e in all_edges:
         key = (e["from"], e["to"], e["type"])
         if key not in existing_edge_keys:
@@ -676,7 +817,8 @@ def run(input_title: str):
     save_graph(graph)
     ok("Graph saved to graph.json")
 
-    # Step 8b: Persist to PostgreSQL
+    # Step 9: Persist to PostgreSQL
+    semantic_edges = []
     conn = get_db_conn()
     if conn:
         try:
@@ -691,38 +833,169 @@ def run(input_title: str):
             })
             conn.commit()
             ok("Written to PostgreSQL")
+
+            # Step 10: Embedding + semantic edges
+            log("Generating embedding...", SILVER)
+            vec = generate_embedding(node)
+            if vec:
+                ok(f"Embedding generated ({len(vec)}-dim)")
+                db_write_embedding(conn, wiki["title"], vec)
+
+                neighbors = find_semantic_neighbors(conn, wiki["title"], vec)
+                if neighbors:
+                    now = datetime.now(timezone.utc).isoformat()
+                    for neighbor_id, sim_score in neighbors:
+                        se = {
+                            "from":            wiki["title"],
+                            "to":              neighbor_id,
+                            "type":            "semantic",
+                            "predicate":       "semantically similar to",
+                            "weight":          sim_score,
+                            "source":          "embedding_similarity",
+                            "source_sentence": f"Cosine similarity: {sim_score:.3f}",
+                            "created_at":      now,
+                        }
+                        semantic_edges.append(se)
+                    db_write_edges(conn, semantic_edges)
+                    # Add to graph.json
+                    for e in semantic_edges:
+                        key = (e["from"], e["to"], e["type"])
+                        if key not in existing_edge_keys:
+                            graph["edges"].append(e)
+                            existing_edge_keys.add(key)
+                    save_graph(graph)
+                    ok(f"Semantic edges: {len(semantic_edges)} neighbors found (threshold 0.72)")
+
+                conn.commit()
+            else:
+                warn("Embedding skipped (sentence-transformers not installed)")
+
         except Exception as e:
             err(f"PostgreSQL write failed: {e}")
             conn.rollback()
         finally:
             conn.close()
 
-    # Step 9: Display
+    # Step 11: Display
     print_node(node)
-    print_summary(graph, node, structural_edges, inferred_edges, frontier_updates)
+    print_summary(graph, node, structural_edges, inferred_edges, frontier_updates, semantic_edges)
 
-    # Step 10: Suggest next nodes (from inferred edges - these are the meaningful ones)
     if inferred_edges:
         log("Suggested next articles to classify:", CYAN)
         for e in inferred_edges[:5]:
             dim(f'python pipeline.py "{e["to"]}"   ({e["predicate"]})')
         print()
 
+# --- Frontier drain worker ---
+def drain_frontier(batch_size: int = 5):
+    """Process unclassified items from the frontier queue."""
+    log(f"Frontier worker: draining up to {batch_size} items...", GOLD)
+
+    conn = get_db_conn()
+    if conn is None:
+        err("No DB connection. Cannot drain frontier.")
+        sys.exit(1)
+
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT f.id, f.title
+            FROM frontier f
+            LEFT JOIN nodes n ON n.id = f.id AND n.classified = true
+            WHERE n.id IS NULL
+            ORDER BY
+              CASE WHEN f.linked_from IS NULL THEN 0 ELSE 1 END ASC,
+              f.added_at DESC
+            LIMIT %s
+        """, (batch_size,))
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        err(f"Frontier query failed: {e}")
+        conn.close()
+        sys.exit(1)
+    finally:
+        conn.close()
+
+    if not rows:
+        log("Frontier queue is empty. Nothing to process.", SILVER)
+        return
+
+    log(f"Found {len(rows)} item(s) to classify:", CYAN)
+    for _, title in rows:
+        dim(f"  - {title}")
+    print()
+
+    succeeded = 0
+    failed    = 0
+    removed   = 0
+    for i, (node_id, title) in enumerate(rows):
+        log(f"[{i+1}/{len(rows)}] Processing: \"{title}\"", CYAN)
+        try:
+            run(title)
+            succeeded += 1
+        except SystemExit as e:
+            if e.code == 2:
+                # Permanent failure (article not found / too short) — remove from frontier
+                try:
+                    conn2 = get_db_conn()
+                    if conn2:
+                        c2 = conn2.cursor()
+                        c2.execute("DELETE FROM frontier WHERE id = %s", (node_id,))
+                        conn2.commit()
+                        c2.close()
+                        conn2.close()
+                except Exception:
+                    pass
+                warn(f'  Removed "{title}" from frontier (article not found)')
+                removed += 1
+            elif e.code != 0:
+                warn(f'  Skipped "{title}" (pipeline error {e.code})')
+                failed += 1
+        except Exception as e:
+            err(f'  Failed "{title}": {e}')
+            failed += 1
+
+    print()
+    log("=" * 50, GOLD)
+    ok(f"Drain complete: {succeeded} classified, {failed} failed, {removed} removed (not found)")
+    log("=" * 50, GOLD)
+
 # --- Random article ---
 def fetch_random_title() -> str:
     resp = requests.get(
         "https://en.wikipedia.org/w/api.php",
-        params={"action": "query", "list": "random", "rnnamespace": 0, "rnlimit": 1, "format": "json"}, headers={"User-Agent": "WikiFold/0.1 (learning graph project)"},
+        params={"action": "query", "list": "random", "rnnamespace": 0, "rnlimit": 1, "format": "json"},
+        headers={"User-Agent": "WikiFold/0.1 (learning graph project)"},
         timeout=10,
     )
     resp.raise_for_status()
     return resp.json()["query"]["random"][0]["title"]
 
+# --- API key check ---
+API_KEY = os.getenv("LLM_API_KEY")
+MODEL   = os.getenv("MODEL", "claude-haiku-4-5-20251001")
+
+if not API_KEY:
+    print("\n  ERROR: LLM_API_KEY not found in .env\n")
+    sys.exit(1)
+
 # --- Entry point ---
 if __name__ == "__main__":
     args = sys.argv[1:]
 
-    if "--random" in args or "-r" in args:
+    # Worker / drain mode
+    if "--worker" in args or "--drain" in args:
+        batch = 5
+        for a in args:
+            if a.startswith("--batch="):
+                try:
+                    batch = int(a.split("=")[1])
+                except ValueError:
+                    pass
+        drain_frontier(batch)
+
+    elif "--random" in args or "-r" in args:
         log("Fetching a random Wikipedia article...", SILVER)
         try:
             random_title = fetch_random_title()
@@ -737,14 +1010,15 @@ if __name__ == "__main__":
 
     else:
         print()
-        log("╔══════════════════════════════════════════╗", GOLD)
-        log("║          WikiFold Pipeline v0.1          ║", GOLD)
-        log("╚══════════════════════════════════════════╝", GOLD)
+        log("+===========================================+", GOLD)
+        log("|          WikiFold Pipeline v0.2          |", GOLD)
+        log("+===========================================+", GOLD)
         print()
         log("  Options:", SILVER)
-        dim('python pipeline.py "Article Title"   classify a specific article')
-        dim("python pipeline.py --random           classify a random article (your seed)")
-        dim("python pipeline.py                    interactive prompt")
+        dim('python pipeline.py "Article Title"       classify a specific article')
+        dim("python pipeline.py --random               classify a random article")
+        dim("python pipeline.py --worker               drain the frontier queue (batch 5)")
+        dim("python pipeline.py --worker --batch=10    drain 10 items at a time")
         print()
         title = input(f"{GOLD}  Article title (or press Enter for random): {RESET}").strip()
         if not title:
