@@ -292,40 +292,47 @@ function makeSimulation() {
     .force('link', d3.forceLink()
       .id(d => d.id)
       .distance(d => {
-        if (d._src === 'embedding_similarity') return 160; // semantic — medium pull
-        if (d._src === 'ai_inference')         return 120; // typed — close
-        return 220; // structural/frontier — push to periphery
+        if (d._ghost_edge) return 340;             // ghost edges — long tether, keeps them in the outer ring
+        if (d._src === 'embedding_similarity') return 160;
+        if (d._src === 'ai_inference')         return 120;
+        return 260;
       })
       .strength(d => {
+        if (d._ghost_edge) return 0.04;            // weak pull — ghost nodes drift out, not snapped close
         if (d._src === 'embedding_similarity') return 0.30;
         if (d._src === 'ai_inference')         return 0.55;
-        return 0.08; // structural — very weak, just keeps frontier attached
+        return 0.08;
       })
     )
     .force('charge', d3.forceManyBody()
       .strength(d => d.ghost
-        ? (d.typed_ghost ? -60 : -80)       // typed ghosts cluster near parent; structural ghosts push further
+        ? -180                                     // strong repulsion — ghosts push each other and classified nodes away
         : -(320 + (d.depth_score || 3) * 32))
-      .distanceMax(600)
+      .distanceMax(700)
     )
     .force('collide', d3.forceCollide()
-      .radius(d => (d.ghost ? (d.typed_ghost ? 14 : 10) : nodeRadius(d)) + 24)
+      .radius(d => (d.ghost ? 10 : nodeRadius(d)) + 24)
       .iterations(3)
     )
-    .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.05))
-    // Soft domain-clustering: pull nodes with the same primary domain toward each other
+    .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.04))
+    // Ghost nodes pushed outward to a ring — classified nodes cluster in the middle
+    .force('ghost_radial', d3.forceRadial(
+      d => d.ghost ? Math.min(graphCenterX(), H()/2) * 0.75 : 0,
+      graphCenterX(), H()/2
+    ).strength(d => d.ghost ? 0.35 : 0))
+    // Soft domain-clustering for classified nodes only
     .force('domain_x', d3.forceX(d => {
       if (d.ghost) return graphCenterX();
       const domainIndex = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
       const angle = (domainIndex / Object.keys(DOMAIN_COLOR).length) * 2 * Math.PI;
       return graphCenterX() + Math.cos(angle) * 140;
-    }).strength(0.04))
+    }).strength(d => d.ghost ? 0 : 0.04))
     .force('domain_y', d3.forceY(d => {
       if (d.ghost) return H() / 2;
       const domainIndex = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
       const angle = (domainIndex / Object.keys(DOMAIN_COLOR).length) * 2 * Math.PI;
       return H() / 2 + Math.sin(angle) * 140;
-    }).strength(0.04))
+    }).strength(d => d.ghost ? 0 : 0.04))
     .alphaDecay(0.018);
 }
 
@@ -433,7 +440,8 @@ async function loadGraph() {
 
   gLinks = visEdges.map(e => ({
     ...e,
-    _src:   e.source,   // 'ai_inference' | 'embedding_similarity' | 'wikipedia_links'
+    _src:        e.source,
+    _ghost_edge: !nodeIds.has(e.from) || !nodeIds.has(e.to), // one end is unclassified
     source: e.from,
     target: e.to,
   }));
