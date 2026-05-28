@@ -62,22 +62,13 @@ python3 -m py_compile "$REPO_DIR/pipeline.py"
 # Backup current server.js before overwriting
 cp "$PROXY_DIR/server.js" "$PROXY_DIR/server.js.bak"
 
-# Sync static site (index.html, app.js, style.css, etc.)
+# Sync files explicitly — avoids rsync include/exclude subdirectory gotchas
 echo "[5/7] Syncing files..."
-rsync -av --checksum \
-  --include="index.html" \
-  --include="pipeline.py" \
-  --include="js/" \
-  --include="js/app.js" \
-  --include="css/" \
-  --include="css/style.css" \
-  --exclude="*" \
-  "$REPO_DIR/" "$STATIC_DIR/"
-
-# Sync server.js to proxy dir
-rsync -av --checksum \
-  "$REPO_DIR/server.js" "$PROXY_DIR/server.js"
-
+rsync -av --checksum "$REPO_DIR/index.html"        "$STATIC_DIR/index.html"
+rsync -av --checksum "$REPO_DIR/pipeline.py"       "$STATIC_DIR/pipeline.py"
+rsync -av --checksum "$REPO_DIR/js/app.js"         "$STATIC_DIR/js/app.js"
+rsync -av --checksum "$REPO_DIR/css/style.css"     "$STATIC_DIR/css/style.css"
+rsync -av --checksum "$REPO_DIR/server.js"         "$PROXY_DIR/server.js"
 echo "Files synced."
 REMOTE
 
