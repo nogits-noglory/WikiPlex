@@ -64,11 +64,12 @@ cp "$PROXY_DIR/server.js" "$PROXY_DIR/server.js.bak"
 
 # Sync files explicitly — avoids rsync include/exclude subdirectory gotchas
 echo "[5/7] Syncing files..."
-rsync -av --checksum "$REPO_DIR/index.html"        "$STATIC_DIR/index.html"
-rsync -av --checksum "$REPO_DIR/pipeline.py"       "$STATIC_DIR/pipeline.py"
-rsync -av --checksum "$REPO_DIR/js/app.js"         "$STATIC_DIR/js/app.js"
-rsync -av --checksum "$REPO_DIR/css/style.css"     "$STATIC_DIR/css/style.css"
-rsync -av --checksum "$REPO_DIR/server.js"         "$PROXY_DIR/server.js"
+# Repo layout is flat; server dirs are structured
+rsync -av --checksum "$REPO_DIR/index.html"    "$STATIC_DIR/index.html"
+rsync -av --checksum "$REPO_DIR/pipeline.py"   "$STATIC_DIR/pipeline.py"
+rsync -av --checksum "$REPO_DIR/app.js"        "$STATIC_DIR/js/app.js"
+rsync -av --checksum "$REPO_DIR/style.css"     "$STATIC_DIR/css/style.css"
+rsync -av --checksum "$REPO_DIR/server.js"     "$PROXY_DIR/server.js"
 echo "Files synced."
 REMOTE
 
