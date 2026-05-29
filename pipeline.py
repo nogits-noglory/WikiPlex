@@ -996,7 +996,9 @@ SEED_ARTICLES = [
 ]
 
 def backfill_images():
-    """Fetch thumbnail_url for all classified nodes that currently have none."""
+    """Fetch thumbnail_url for all classified nodes that currently have none.
+    Uses the lightweight REST summary endpoint — no full article fetch needed."""
+    import urllib.parse as _ul
     conn = get_db_conn()
     if not conn:
         err("No DB connection for backfill-images")
@@ -1007,20 +1009,29 @@ def backfill_images():
         rows = cur.fetchall()
         cur.close()
         log(f"Backfilling images for {len(rows)} nodes...", GOLD)
+        headers = {"User-Agent": "WikiFold/0.1 (learning graph project)"}
         updated = 0
         for (node_id,) in rows:
             try:
-                wiki = fetch_wikipedia(node_id)
-                url = wiki.get("thumbnail_url")
-                if url:
-                    c2 = conn.cursor()
-                    c2.execute("UPDATE nodes SET thumbnail_url = %s WHERE id = %s", (url, node_id))
-                    c2.close()
-                    conn.commit()
-                    ok(f"  {node_id}: {url[:60]}...")
-                    updated += 1
+                encoded = _ul.quote(node_id.replace(" ", "_"), safe="")
+                resp = requests.get(
+                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}",
+                    headers=headers, timeout=8
+                )
+                if resp.status_code == 200:
+                    thumb = resp.json().get("thumbnail", {}).get("source")
+                    if thumb:
+                        c2 = conn.cursor()
+                        c2.execute("UPDATE nodes SET thumbnail_url = %s WHERE id = %s", (thumb, node_id))
+                        c2.close()
+                        conn.commit()
+                        ok(f"  {node_id}")
+                        updated += 1
+                    else:
+                        dim(f"  {node_id}: no thumbnail")
                 else:
-                    dim(f"  {node_id}: no thumbnail found")
+                    dim(f"  {node_id}: HTTP {resp.status_code}")
+                time.sleep(0.4)  # stay well under rate limits
             except Exception as e:
                 warn(f"  {node_id}: {e}")
         log(f"Updated {updated}/{len(rows)} nodes with thumbnails.", GOLD)

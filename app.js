@@ -310,20 +310,20 @@ function makeSimulation() {
     )
     .force('charge', d3.forceManyBody()
       .strength(d => d.ghost
-        ? -22   // light repulsion — just enough to spread ghosts along the ring
+        ? -12   // minimal — just enough to prevent stacking on the ring
         : -(320 + (d.depth_score || 3) * 32))
-      .distanceMax(d => d.ghost ? 120 : 600)
+      .distanceMax(d => d.ghost ? 80 : 600)
     )
     .force('collide', d3.forceCollide()
-      .radius(d => (d.ghost ? 10 : nodeRadius(d)) + (d.ghost ? 14 : 24))
+      .radius(d => (d.ghost ? 10 : nodeRadius(d)) + (d.ghost ? 12 : 24))
       .iterations(3)
     )
     .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.04))
-    // Dominant radial force — ghosts orbit at GHOST_RING_R from center
+    // Dominant radial force — ghosts snap to GHOST_RING_R from center
     .force('ghost_radial', d3.forceRadial(
       d => d.ghost ? GHOST_RING_R() : 0,
       graphCenterX(), H()/2
-    ).strength(d => d.ghost ? 0.80 : 0))
+    ).strength(d => d.ghost ? 0.92 : 0))
     // Domain-clustering for classified nodes only
     .force('domain_x', d3.forceX(d => {
       if (d.ghost) return graphCenterX();
@@ -369,54 +369,58 @@ async function loadGraph() {
     nodeIds.has(e.from) && nodeIds.has(e.to) && e.source !== 'wikipedia_links'
   );
 
-  // ── Ghost (frontier) nodes — two tiers:
+  // ── Ghost (frontier) nodes — two tiers, hard-capped for a clean ring:
   //
-  //  Tier 1: TYPED ghosts — any unclassified node connected to a classified node
-  //          via a rich typed edge (interpersonal, geographical, etc.).
-  //          Show ALL of them (up to 80); show every typed edge.
-  //          These are exactly the relationships the classifier identified.
+  //  Tier 1: TYPED ghosts — top 40 unclassified nodes by number of typed edges
+  //          pointing to them. One typed edge each (highest-weight connection).
   //
-  //  Tier 2: STRUCTURAL ghosts — unclassified nodes referenced 2+ times via
-  //          raw Wikipedia link edges (not already in tier 1).
-  //          Top 30 by reference count; one structural edge each.
+  //  Tier 2: STRUCTURAL ghosts — top 15 unclassified nodes referenced 3+ times
+  //          by classified nodes via raw Wikipedia links (not already in tier 1).
+  //
+  //  Total cap: ~55 ghost nodes → clean concentric ring.
 
-  // Tier 1: all typed edges pointing to unclassified nodes
-  const typedGhostEdges = allEdges.filter(e =>
-    nodeIds.has(e.from) && !nodeIds.has(e.to) && e.source !== 'wikipedia_links'
+  // Count typed-edge references per unclassified target
+  const typedGhostCount = new Map();
+  allEdges.forEach(e => {
+    if (nodeIds.has(e.from) && !nodeIds.has(e.to) && e.source !== 'wikipedia_links')
+      typedGhostCount.set(e.to, (typedGhostCount.get(e.to)||0)+1);
+  });
+  // Top 40 by reference count; one best typed edge per ghost
+  const typedGhostIds = new Set(
+    [...typedGhostCount.entries()].sort((a,b)=>b[1]-a[1]).slice(0,40).map(([id])=>id)
   );
-  const typedGhostIds = new Set(typedGhostEdges.map(e => e.to));
+  const typedGhostBestEdge = new Map();
+  allEdges.forEach(e => {
+    if (!typedGhostIds.has(e.to) || !nodeIds.has(e.from) || e.source === 'wikipedia_links') return;
+    const prev = typedGhostBestEdge.get(e.to);
+    if (!prev || (e.weight||0) > (prev.weight||0)) typedGhostBestEdge.set(e.to, e);
+  });
 
-  // Tier 2: structural-only unclassified neighbors (skip tier-1 nodes)
+  // Structural-only ghosts (not already in typed tier)
   const structNeighborCount = new Map();
   allEdges.forEach(e => {
     if (e.source !== 'wikipedia_links') return;
     if (nodeIds.has(e.from) && !nodeIds.has(e.to) && !typedGhostIds.has(e.to))
       structNeighborCount.set(e.to, (structNeighborCount.get(e.to)||0)+1);
-    if (nodeIds.has(e.to) && !nodeIds.has(e.from) && !typedGhostIds.has(e.from))
-      structNeighborCount.set(e.from, (structNeighborCount.get(e.from)||0)+1);
   });
   const structGhostIds = [...structNeighborCount.entries()]
-    .filter(([, count]) => count >= 2)
+    .filter(([,c]) => c >= 3)
     .sort((a,b) => b[1]-a[1])
-    .slice(0, 30)
+    .slice(0, 15)
     .map(([id]) => id);
   const structGhostIdSet = new Set(structGhostIds);
 
-  // One structural edge per tier-2 ghost (highest-weight connection)
   const structGhostBestEdge = new Map();
   allEdges.forEach(e => {
     if (e.source !== 'wikipedia_links') return;
-    const fromGhost = structGhostIdSet.has(e.from) && nodeIds.has(e.to);
-    const toGhost   = structGhostIdSet.has(e.to)   && nodeIds.has(e.from);
-    if (!fromGhost && !toGhost) return;
-    const ghostId = fromGhost ? e.from : e.to;
-    const prev = structGhostBestEdge.get(ghostId);
-    if (!prev || (e.weight||0) > (prev.weight||0)) structGhostBestEdge.set(ghostId, e);
+    if (!structGhostIdSet.has(e.to) || !nodeIds.has(e.from)) return;
+    const prev = structGhostBestEdge.get(e.to);
+    if (!prev || (e.weight||0) > (prev.weight||0)) structGhostBestEdge.set(e.to, e);
   });
 
   const allGhostIds   = [...typedGhostIds, ...structGhostIds];
   const ghostIdSet    = new Set(allGhostIds);
-  const frontierEdges = [...typedGhostEdges, ...structGhostBestEdge.values()];
+  const frontierEdges = [...typedGhostBestEdge.values(), ...structGhostBestEdge.values()];
 
   const visEdges = [...richClassifiedEdges, ...frontierEdges];
 
@@ -485,6 +489,9 @@ async function loadGraph() {
 /* ── Render / update graph ── */
 function renderGraph() {
   if (!simulation) simulation = makeSimulation();
+  // Re-center the ghost ring when the panel state changes viewport width
+  const radial = simulation.force('ghost_radial');
+  if (radial) radial.x(graphCenterX()).y(H()/2);
 
   /* ── SVG image patterns for thumbnail nodes ── */
   svgDefs.selectAll('pattern.nip')
