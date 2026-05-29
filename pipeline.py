@@ -889,10 +889,7 @@ Here is an excerpt from its Wikipedia article:
 Here are {len(existing_nodes)} other articles already in our knowledge graph:
 {node_list}
 
-Find any GENUINE relationships between "{new_title}" and the listed articles.
-Only include relationships that are factually grounded and specific.
-Think broadly: geographical proximity, shared time periods, shared domain, causal links,
-analogies, mutual influence, shared people, shared themes.
+Find DIRECT, SPECIFIC relationships between "{new_title}" and the listed articles.
 
 Return JSON exactly:
 {{
@@ -902,7 +899,7 @@ Return JSON exactly:
       "to": "exact title from the list above",
       "predicate": "one predicate from the vocabulary",
       "edge_type": "interpersonal | geographical | temporal | categorical | etymological | positional | implication | misconception | analogy | influence | application",
-      "reasoning": "one sentence factual justification"
+      "reasoning": "one sentence factual justification citing a specific named fact"
     }}
   ]
 }}
@@ -913,8 +910,11 @@ Predicate vocabulary:
 Rules:
 - "to" must be the exact title from the list above.
 - Never force a connection. If no genuine relationship exists, return {{"cross_edges": []}}.
-- Maximum 10 cross-edges.
-- Do not add edges between articles with no meaningful connection beyond both existing in Wikipedia."""
+- Maximum 6 cross-edges.
+- Only add an edge if the two articles have a DIRECT, NAMED connection — a shared person, a documented event, a direct creation or adaptation relationship, a specific causal link.
+- REJECT any connection based on: broad thematic similarity, shared genre, general cultural influence, or "both deal with X."
+- INFLUENCE edges are BANNED unless the article text for "{new_title}" explicitly names the other article as an influence or vice versa. Thematic similarity is not influence.
+- Ask: would a Wikipedia editor add a link between these two articles? If no, skip it."""
 
     return system, user
 
@@ -1359,11 +1359,26 @@ def run(input_title: str, force: bool = False):
             else:
                 warn("Embedding skipped (sentence-transformers not installed)")
 
-            # Step 10b: Cross-node edge inference — disabled.
-            # LLM-inferred cross-edges produce overly loose connections (slippery-slope
-            # influence chains) and double the API cost per classification.
-            # Semantic embedding similarity (step 10a) already handles real inter-article
-            # connections using cosine distance, which is a stronger signal.
+            # Step 10b: Cross-node edge inference
+            log("Generating cross-node edges...", SILVER)
+            conn2 = get_db_conn()
+            if conn2:
+                try:
+                    cross_edges = generate_cross_edges(wiki["title"], wiki["text"], conn2)
+                    if cross_edges:
+                        db_write_edges(conn2, cross_edges)
+                        conn2.commit()
+                        for e in cross_edges:
+                            key = (e["from"], e["to"], e["type"])
+                            if key not in existing_edge_keys:
+                                graph["edges"].append(e)
+                                existing_edge_keys.add(key)
+                        save_graph(graph)
+                except Exception as e:
+                    warn(f"Cross-edge step failed: {e}")
+                    conn2.rollback()
+                finally:
+                    conn2.close()
 
         except Exception as e:
             err(f"PostgreSQL write failed: {e}")
