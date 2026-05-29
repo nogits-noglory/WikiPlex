@@ -237,7 +237,7 @@ let pathSessionId  = null;
 let pathSse        = null;
 let pathFrom       = '';
 let pathTo         = '';
-let pathResults    = {}; // type -> { nodes, edges }
+let pathResults    = []; // array of path objects
 let savedGraph     = null; // { gNodes, gLinks, rawNodes } snapshot saved on enterPathMode
 
 const zoomBehavior = d3.zoom()
@@ -704,9 +704,20 @@ function renderGraph() {
       exit => exit.transition().duration(250).attr('opacity',0).remove()
     )
     .call(d3.drag()
-      .on('start', (ev,d) => { if(!ev.active) simulation.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
-      .on('drag',  (ev,d) => { d.fx=ev.x; d.fy=ev.y; })
-      .on('end',   (ev,d) => { if(!ev.active) simulation.alphaTarget(0); d.fx=null; d.fy=null; })
+      .on('start', (ev,d) => {
+        if (pathMode && (d._pathRole === 'from' || d._pathRole === 'to')) return;
+        if (!ev.active) simulation.alphaTarget(0.3).restart();
+        d.fx = d.x; d.fy = d.y;
+      })
+      .on('drag', (ev,d) => {
+        if (pathMode && (d._pathRole === 'from' || d._pathRole === 'to')) return;
+        d.fx = ev.x; d.fy = ev.y;
+      })
+      .on('end', (ev,d) => {
+        if (pathMode && (d._pathRole === 'from' || d._pathRole === 'to')) return;
+        if (!ev.active) simulation.alphaTarget(0);
+        d.fx = null; d.fy = null;
+      })
     )
     .on('click', (event, d) => {
       event.stopPropagation();
@@ -723,6 +734,32 @@ function renderGraph() {
   // Update node geometry and personal states
   nodeG.selectAll('g.node').each(function(d) {
     const g = d3.select(this);
+
+    // ── Path mode branch nodes ────────────────────────────────────────
+    // Unclassified nodes that exist only because they're connected via
+    // AI-inferred edges from one or both path endpoints.
+    if (pathMode && !d.classified) {
+      const isConnection = d._pathSide === 'both';  // connects both endpoints
+      const r = isConnection ? 14 : 7;
+      const col = isConnection ? '#00ffcc' : '#3a7acc';
+      g.select('.node-main').attr('r', r)
+        .attr('fill', isConnection ? '#003322' : '#0d2235')
+        .attr('opacity', 1)
+        .attr('stroke', col)
+        .attr('stroke-width', isConnection ? 2.5 : 1.5);
+      g.select('.node-glow').attr('r', r + (isConnection ? 14 : 7))
+        .attr('fill', col)
+        .attr('opacity', isConnection ? 0.45 : 0.18);
+      g.select('.node-ring').attr('r', 0).attr('stroke', 'none');
+      g.select('.node-conquest-ring').attr('opacity', 0);
+      g.select('.node-core').attr('r', 0);
+      g.select('.node-label')
+        .attr('fill', isConnection ? '#00ffcc' : '#4488cc')
+        .attr('dy', r + 14)
+        .attr('opacity', isConnection ? 1 : 0.75)
+        .text(truncLabel(d.title));
+      return;
+    }
 
     // Ghost (frontier) nodes — visible dim dots, clickable
     // Typed ghosts (connected via a real relationship) are slightly brighter and larger
@@ -959,31 +996,91 @@ function connectSSE() {
    KNOWLEDGE PATH FINDER
 ══════════════════════════════════════════════ */
 
-/* Enter isolated path mode: save graph, clear display */
+/* Set simulation forces for path mode:
+ *   FROM pinned left, TO pinned right, branches spread by side.
+ *   Called after renderGraph() has initialised the simulation. */
+function applyPathForces() {
+  if (!simulation) return;
+  const cx = WORLD_CX, cy = WORLD_CY;
+
+  // Remove main-graph domain/ghost forces
+  simulation.force('domain_x',    null);
+  simulation.force('domain_y',    null);
+  simulation.force('ghost_radial',null);
+  simulation.force('center',      null);
+
+  // Spread nodes left/right by which endpoint they connect to
+  simulation.force('path_x', d3.forceX(d => {
+    if (d._pathRole === 'from')         return cx - 550;
+    if (d._pathRole === 'to')           return cx + 550;
+    if (d._pathSide === 'both')         return cx;
+    if (d._pathSide === 'from')         return cx - 280;
+    if (d._pathSide === 'to')           return cx + 280;
+    return cx;
+  }).strength(d =>
+    (d._pathRole === 'from' || d._pathRole === 'to') ? 0 : 0.18
+  ));
+
+  simulation.force('path_y', d3.forceY(cy).strength(d =>
+    (d._pathRole === 'from' || d._pathRole === 'to') ? 0 : 0.04
+  ));
+
+  // Stronger repulsion so branch nodes don't pile up
+  simulation.force('charge', d3.forceManyBody()
+    .strength(d =>
+      (d._pathRole === 'from' || d._pathRole === 'to') ? 0 : -1400
+    )
+    .distanceMax(2000)
+  );
+
+  simulation.force('collide', d3.forceCollide()
+    .radius(d => nodeRadius(d) + 55).iterations(3)
+  );
+
+  simulation.force('link', d3.forceLink()
+    .id(d => d.id)
+    .distance(320).strength(0.2)
+  );
+
+  simulation.alpha(1).alphaDecay(0.018).restart();
+}
+
+/* Restore the main-graph simulation forces after leaving path mode */
+function restoreMainForces() {
+  if (!simulation) return;
+  simulation.force('path_x',  null);
+  simulation.force('path_y',  null);
+  // Rebuild the full main-graph simulation from scratch on next renderGraph
+  simulation.stop();
+  simulation = null;
+}
+
+/* Enter isolated path mode */
 function enterPathMode(fromTitle, toTitle, sessionId) {
   pathMode      = true;
   pathFrom      = fromTitle;
   pathTo        = toTitle;
   pathSessionId = sessionId;
-  pathResults   = {};
+  pathResults   = [];
 
-  // Save current graph state so we can restore it on exit
+  // Save current graph so we can restore on exit
   savedGraph = { gNodes: [...gNodes], gLinks: [...gLinks], rawNodes: { ...rawNodes } };
 
-  // Clear SVG to show only path nodes
-  gNodes = [];
-  gLinks = [];
+  // Clear to blank canvas — nodes arrive via SSE
+  gNodes   = [];
+  gLinks   = [];
   rawNodes = {};
   renderGraph();
+  applyPathForces();
+  requestAnimationFrame(() => fitGraph(400));
 
-  // Open the path panel
+  // Open path panel
   $('study-tabs').classList.add('hidden');
-  setPanelHeader('Knowledge Path', null, null);
+  setPanelHeader('Path: ' + fromTitle + ' → ' + toTitle, null, null);
   renderPathPanel('searching');
   showPC('pc-pathfind');
   openPanel('pathfind');
 
-  // Persist session for reconnect
   try {
     localStorage.setItem('wd_path_session', JSON.stringify({
       sessionId, from: fromTitle, to: toTitle, startedAt: Date.now()
@@ -996,98 +1093,122 @@ function enterPathMode(fromTitle, toTitle, sessionId) {
 /* Exit path mode: restore graph and close panel */
 function exitPathMode() {
   pathMode  = false;
-  panelMode = 'idle'; // reset before closePanel guard checks it
+  panelMode = 'idle';
   if (pathSse) { pathSse.close(); pathSse = null; }
   try { localStorage.removeItem('wd_path_session'); } catch {}
 
-  // Restore full graph
+  restoreMainForces();
+
   if (savedGraph) {
     gNodes   = savedGraph.gNodes;
     gLinks   = savedGraph.gLinks;
     rawNodes = savedGraph.rawNodes;
     savedGraph = null;
     renderGraph();
+    requestAnimationFrame(() => fitGraph(500, true));
   } else {
     loadGraph();
   }
 
-  // Hide resume banner
   const banner = $('path-resume-banner');
   if (banner) banner.classList.add('hidden');
-
-  // Close the panel properly
   $('detail-panel').classList.remove('open');
   $('study-tabs').classList.add('hidden');
   $('btn-back-to-map')?.classList.add('hidden');
   showPC('pc-idle');
   deselect();
-  if (window.innerWidth > 768) nudgeGraph(false);
   renderLibrary();
 }
 
-/* Add a node from path results to the path-mode graph */
-function addPathNode(node) {
+/* Add or update a node in the path graph */
+function addPathNode(node, role, side) {
   if (!pathMode || !node) return;
-  if (gNodes.find(n => n.id === (node.id || node.title))) return;
-  rawNodes[node.id || node.title] = node;
-  const cx = graphCenterX(), cy = H() / 2;
-  gNodes.push({ ...node, x: cx + (Math.random() - .5) * 220, y: cy + (Math.random() - .5) * 220 });
+  const id = node.id || node.title;
+  const existing = gNodes.find(n => n.id === id);
+  if (existing) {
+    // Upgrade properties if we now know more
+    if (role)  { existing._pathRole = role; }
+    if (side)  { existing._pathSide = side; }
+    if (role === 'from') { existing.fx = WORLD_CX - 550; existing.fy = WORLD_CY; }
+    if (role === 'to')   { existing.fx = WORLD_CX + 550; existing.fy = WORLD_CY; }
+    rawNodes[id] = { ...rawNodes[id], ...node };
+    renderGraph();
+    return;
+  }
+  rawNodes[id] = node;
+
+  // Pin endpoints; let branch nodes float
+  const pin = role === 'from'
+    ? { fx: WORLD_CX - 550, fy: WORLD_CY, x: WORLD_CX - 550, y: WORLD_CY }
+    : role === 'to'
+    ? { fx: WORLD_CX + 550, fy: WORLD_CY, x: WORLD_CX + 550, y: WORLD_CY }
+    : {
+        x: (side === 'from' ? WORLD_CX - 280 : side === 'to' ? WORLD_CX + 280 : WORLD_CX)
+           + (Math.random() - .5) * 200,
+        y: WORLD_CY + (Math.random() - .5) * 300,
+      };
+
+  gNodes.push({ ...node, ...pin, _pathRole: role || null, _pathSide: side || null });
   renderGraph();
 }
 
-/* Add edges from a found path result */
-function addPathEdges(edges) {
-  if (!pathMode || !edges?.length) return;
-  let added = false;
-  for (const e of edges) {
-    const from = e.from_node || e.from;
-    const to   = e.to_node   || e.to;
-    if (!from || !to) continue;
-    const key = `${from}||${to}||${e.predicate}`;
-    if (gLinks.find(l => `${l.from}||${l.to}||${l.predicate}` === key)) continue;
-    gLinks.push({
-      from, to, type: e.edge_type || e.type,
-      predicate: e.predicate || '',
-      _src: e.edge_source === 'embedding_similarity' ? 'embedding_similarity' : 'ai_inference',
-      weight: e.weight || 1,
-      source: from, target: to,
-    });
-    added = true;
-  }
-  if (added) renderGraph();
+/* Add a single edge to the path graph */
+function addPathLink(from, to, edgeType, predicate, source) {
+  if (!pathMode) return;
+  const key = `${from}||${to}`;
+  if (gLinks.find(l => `${l.source?.id || l.source}||${l.target?.id || l.target}` === key
+                    || `${l.target?.id || l.target}||${l.source?.id || l.source}` === key)) return;
+  gLinks.push({
+    from, to, type: edgeType, predicate: predicate || '',
+    _src: source === 'embedding_similarity' ? 'embedding_similarity' : 'ai_inference',
+    weight: 1, source: from, target: to,
+  });
+  renderGraph();
 }
 
-/* Render path panel content */
+/* Mark nodes involved in a confirmed path with _pathSide:'both' */
+function highlightPathNodes(nodes) {
+  for (const title of nodes) {
+    const n = gNodes.find(g => g.id === title);
+    if (n && n._pathRole !== 'from' && n._pathRole !== 'to') {
+      n._pathSide = 'both';
+    }
+  }
+  renderGraph();
+}
+
+/* Render path panel */
 function renderPathPanel(phase) {
   const el = $('pc-pathfind');
   if (!el) return;
 
-  const foundPaths = Object.entries(pathResults).filter(([, p]) => p);
-  const cardsHTML  = foundPaths.map(([type, path]) => renderPathCard(type, path)).join('');
+  const cardsHTML = pathResults.map(p => renderPathCard(p)).join('');
 
-  const statusDot  = (phase === 'searching')
+  const dot = phase === 'searching'
     ? '<span class="pf-status-dot"></span>'
-    : (phase === 'complete' ? '<span class="pf-status-dot done"></span>' : '');
+    : phase === 'complete' ? '<span class="pf-status-dot done"></span>' : '';
 
   const statusText = phase === 'complete'
-    ? `Found ${foundPaths.length} path${foundPaths.length !== 1 ? 's' : ''}`
-    : phase === 'error' ? 'Search encountered an error'
+    ? `${pathResults.length} connection${pathResults.length !== 1 ? 's' : ''} found`
+    : phase === 'error' ? 'Search error'
     : $('pf-status-msg')?.textContent || 'Searching...';
 
   setHTML(el, `
     <div class="pf-panel-header">
       <div class="pf-panel-route">
-        <span class="pf-endpoint" title="${esc(pathFrom)}">${esc(pathFrom.length > 22 ? pathFrom.slice(0,21)+'...' : pathFrom)}</span>
+        <span class="pf-endpoint" title="${esc(pathFrom)}">${esc(pathFrom.length > 20 ? pathFrom.slice(0,19)+'…' : pathFrom)}</span>
         <span class="pf-arrow">&#8594;</span>
-        <span class="pf-endpoint" title="${esc(pathTo)}">${esc(pathTo.length > 22 ? pathTo.slice(0,21)+'...' : pathTo)}</span>
+        <span class="pf-endpoint" title="${esc(pathTo)}">${esc(pathTo.length > 20 ? pathTo.slice(0,19)+'…' : pathTo)}</span>
       </div>
     </div>
-    <div class="pf-status-bar" id="pf-status-bar">
-      ${statusDot}
-      <span id="pf-status-msg">${esc(statusText)}</span>
+    <div class="pf-status-bar">
+      ${dot}<span id="pf-status-msg">${esc(statusText)}</span>
     </div>
     <div class="pf-cards" id="pf-cards">
-      ${cardsHTML || (phase === 'searching' ? '<div class="pf-no-path">Searching for connections...</div>' : '')}
+      ${cardsHTML || (phase === 'searching'
+          ? '<div class="pf-no-path">Branches growing…</div>'
+          : '<div class="pf-no-path">No direct connections found. Intermediate articles have been queued — classify more nodes and run this path again.</div>'
+        )}
     </div>
     <div class="pf-exit-wrap">
       <button class="btn-pf-exit" id="btn-pf-exit">EXIT PATH MODE</button>
@@ -1098,21 +1219,21 @@ function renderPathPanel(phase) {
 }
 
 /* Render a single path card */
-function renderPathCard(type, path) {
+function renderPathCard(path) {
+  const type  = path.path_type || 'categorical';
   const color = EDGE_COLOR[type] || '#5566aa';
   const nodes = path.nodes || [];
-  const hops  = nodes.length - 1;
+  const hops  = path.hops  || (nodes.length - 1);
+  const via   = path.via   || nodes[1] || '';
+  const label = type.charAt(0).toUpperCase() + type.slice(1);
 
   const chain = nodes.map((n, i) => {
     const isEnd = i === 0 || i === nodes.length - 1;
     return `<span class="pf-chain-node${isEnd ? ' endpoint' : ''}"
               style="border-color:${color}55"
-              data-action="pfNodeClick" data-title="${esc(n)}"
-              title="${esc(n)}">${esc(n.length > 20 ? n.slice(0,19)+'...' : n)}</span>${
-      i < nodes.length - 1 ? '<span class="pf-chain-arrow">&#8594;</span>' : ''}`;
+              title="${esc(n)}">${esc(n.length > 22 ? n.slice(0,21)+'…' : n)}</span>${
+      i < nodes.length - 1 ? `<span class="pf-chain-arrow" style="color:${color}">&#8594;</span>` : ''}`;
   }).join('');
-
-  const label = type.charAt(0).toUpperCase() + type.slice(1);
 
   return `<div class="pf-path-card" data-type="${esc(type)}">
     <div class="pf-card-header">
@@ -1121,84 +1242,90 @@ function renderPathCard(type, path) {
       <span class="pf-card-hops">${hops} hop${hops !== 1 ? 's' : ''}</span>
     </div>
     <div class="pf-card-chain">${chain}</div>
-    <div class="pf-card-summary">"${esc(pathFrom)}" reached "${esc(pathTo)}" in ${hops} ${hops === 1 ? 'jump' : 'jumps'} via ${esc(label.toLowerCase())} connections</div>
+    ${via ? `<div class="pf-card-via">via <strong>${esc(via)}</strong></div>` : ''}
   </div>`;
 }
 
-/* Update just the status bar text without full re-render */
 function setPfStatus(msg) {
   const el = $('pf-status-msg');
   if (el) el.textContent = msg;
 }
 
-/* Append a new path card to the cards container */
-function appendPathCard(type, path) {
-  pathResults[type] = path;
+function appendPathCard(path) {
+  pathResults.push(path);
   const container = $('pf-cards');
   if (!container) return;
-
-  // Remove "Searching..." placeholder
   const placeholder = container.querySelector('.pf-no-path');
   if (placeholder) placeholder.remove();
-
   const div = document.createElement('div');
-  div.innerHTML = safeHTML(renderPathCard(type, path));
-  container.appendChild(div.firstElementChild);
+  div.innerHTML = safeHTML(renderPathCard(path));
+  if (div.firstElementChild) container.appendChild(div.firstElementChild);
 }
 
 /* Connect SSE for a path session */
 function connectPathSSE(sessionId) {
   if (pathSse) pathSse.close();
   pathSse = new EventSource(`${PATHFIND_API}/stream/${sessionId}`);
-
   pathSse.addEventListener('message', e => {
-    try {
-      const ev = JSON.parse(e.data);
-      handlePathEvent(ev);
-    } catch {}
-  });
-
-  pathSse.addEventListener('error', () => {
-    // SSE will auto-reconnect if server is still running
+    try { handlePathEvent(JSON.parse(e.data)); } catch {}
   });
 }
 
 /* Handle incoming path session events */
 function handlePathEvent(ev) {
   switch (ev.type) {
-    case 'status':
-      setPfStatus(ev.msg || '');
-      break;
 
+    case 'status':
     case 'warn':
       setPfStatus(ev.msg || '');
       break;
 
-    case 'node_ready':
-      if (ev.node) {
-        addPathNode(ev.node);
-        showToast(`+ ${ev.node.title || ev.node.id}`);
+    case 'node_ready': {
+      if (!ev.node) break;
+      const role = ev.role || null;  // 'from' | 'to' | 'intermediate'
+      addPathNode(ev.node, role, role === 'intermediate' ? null : role);
+      if (role === 'from' || role === 'to') {
+        // Refit once both endpoints have appeared
+        requestAnimationFrame(() => fitGraph(400));
       }
       break;
+    }
 
-    case 'path_found':
-      if (ev.nodes?.length && ev.path_type) {
-        const path = { nodes: ev.nodes, edges: ev.edges || [] };
-        appendPathCard(ev.path_type, path);
-        addPathEdges(ev.edges || []);
-        // Ensure all path nodes are represented in the D3 graph
-        for (const title of ev.nodes) {
-          if (!gNodes.find(n => n.id === title)) {
-            addPathNode({ id: title, title, classified: false, primary_domain: 'other', depth_score: 3 });
-          }
+    case 'branch': {
+      // A single typed edge radiating from one endpoint — add its ghost node + edge
+      const { from, to, edge_type, predicate, source, side } = ev;
+      if (!from || !to) break;
+
+      // Ensure the ghost node exists in the graph
+      if (!gNodes.find(n => n.id === to)) {
+        addPathNode(
+          { id: to, title: to, classified: false, primary_domain: 'other', depth_score: 3 },
+          null, side
+        );
+      }
+      addPathLink(from, to, edge_type, predicate, source);
+      break;
+    }
+
+    case 'path_found': {
+      if (!ev.nodes?.length) break;
+      // Mark all intermediate nodes as 'both' so they render highlighted
+      highlightPathNodes(ev.nodes);
+      appendPathCard(ev);
+      // Ensure intermediate nodes that weren't in a branch event are present
+      for (const title of ev.nodes) {
+        if (!gNodes.find(n => n.id === title)) {
+          addPathNode({ id: title, title, classified: false, primary_domain: 'other', depth_score: 5 }, null, 'both');
         }
       }
       break;
+    }
 
     case 'complete':
       if (pathSse) { pathSse.close(); pathSse = null; }
       try { localStorage.removeItem('wd_path_session'); } catch {}
       renderPathPanel('complete');
+      requestAnimationFrame(() => fitGraph(600));
       break;
 
     case 'error':

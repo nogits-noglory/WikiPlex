@@ -628,149 +628,162 @@ function classifyTitle(title) {
   });
 }
 
-/* Fetch Wikipedia links for a title (namespace 0 only) */
-async function wikiLinksOf(title) {
-  try {
-    const url = `https://en.wikipedia.org/w/api.php?action=query&prop=links&titles=${encodeURIComponent(title)}&pllimit=500&plnamespace=0&format=json&origin=*`;
-    const res = await fetch(url, {
-      signal: AbortSignal.timeout(8_000),
-      headers: { 'User-Agent': 'WikiFold/0.1 (knowledge graph)' },
-    });
-    const data = await res.json();
-    const pages = Object.values(data?.query?.pages || {});
-    return (pages[0]?.links || []).map(l => l.title);
-  } catch { return []; }
-}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-/* Wikipedia link-graph BFS: 1-2 hops max, returns path array or null */
-async function wikiStructuralPath(fromTitle, toTitle) {
-  if (fromTitle === toTitle) return [fromTitle];
-
-  const fromLinks = await wikiLinksOf(fromTitle);
-  if (fromLinks.includes(toTitle)) return [fromTitle, toTitle];
-
-  const candidates = fromLinks.slice(0, 60);
-  const results = await Promise.all(
-    candidates.map(async mid => {
-      try {
-        const midLinks = await wikiLinksOf(mid);
-        return midLinks.includes(toTitle) ? mid : null;
-      } catch { return null; }
-    })
-  );
-  const mid = results.find(r => r !== null);
-  if (mid) return [fromTitle, mid, toTitle];
-  return null;
-}
-
-/* Undirected BFS over a typed edge adjacency map */
-function bfsTyped(adj, start, end) {
-  if (!adj.has(start)) return null;
-  const visited = new Set([start]);
-  const queue   = [[start, [start], []]];
-
-  while (queue.length) {
-    const [curr, pathNodes, pathEdges] = queue.shift();
-    if (curr === end) return { nodes: pathNodes, edges: pathEdges };
-    for (const { to, edge } of (adj.get(curr) || [])) {
-      if (!visited.has(to)) {
-        visited.add(to);
-        queue.push([to, [...pathNodes, to], [...pathEdges, edge]]);
-      }
-    }
-  }
-  return null;
-}
-
-const PATH_FAMILIES = [
-  'interpersonal','geographical','temporal','categorical',
-  'etymological','positional','implication','misconception',
-  'analogy','influence','application','semantic',
-];
-
-/* Load all typed edges and BFS for each family */
-async function findTypedPaths(fromTitle, toTitle) {
-  const result = await pool.query(`
+/* Load all AI-inferred + semantic edges originating from a node */
+async function getNodeEdges(title) {
+  const r = await pool.query(`
     SELECT from_node, to_node, edge_type, predicate, weight, edge_source
     FROM edges
-    WHERE edge_source IN ('ai_inference', 'embedding_similarity')
-  `);
-
-  const adjs = {};
-  for (const fam of PATH_FAMILIES) adjs[fam] = new Map();
-
-  for (const row of result.rows) {
-    const fam = row.edge_type;
-    if (!adjs[fam]) continue;
-    if (!adjs[fam].has(row.from_node)) adjs[fam].set(row.from_node, []);
-    adjs[fam].get(row.from_node).push({ to: row.to_node, edge: row });
-    if (!adjs[fam].has(row.to_node)) adjs[fam].set(row.to_node, []);
-    adjs[fam].get(row.to_node).push({ to: row.from_node, edge: row });
-  }
-
-  const paths = {};
-  for (const fam of PATH_FAMILIES) {
-    paths[fam] = bfsTyped(adjs[fam], fromTitle, toTitle);
-  }
-  return paths;
+    WHERE from_node = $1
+      AND edge_source IN ('ai_inference', 'embedding_similarity')
+    ORDER BY weight DESC NULLS LAST, edge_type
+  `, [title]);
+  return r.rows;
 }
 
-/* Main pathfind orchestrator */
+/* Main pathfind orchestrator
+ *
+ * Algorithm:
+ *   1. Classify both endpoints (if not already done).
+ *   2. Load every AI-inferred edge for each endpoint — these are the
+ *      "branches" that radiate out from each node.
+ *   3. Emit those branches to the client one at a time for animation.
+ *   4. Intersection of the two ghost-neighbor sets = 1-hop typed paths.
+ *   5. Check already-classified intermediaries for 2-hop paths.
+ *   6. Queue all unclassified ghost nodes in the frontier so the graph
+ *      can deepen and the path can be re-run for richer results later.
+ */
 async function runPathfind(sessionId, fromTitle, toTitle) {
-  /* Step 1: classify both endpoints */
+
+  // ── 1. Classify FROM ────────────────────────────────────────────────
   await pathEmit(sessionId, 'status', { msg: `Classifying "${fromTitle}"...` });
-  try {
-    await classifyTitle(fromTitle);
-    const nr = await pool.query('SELECT * FROM nodes WHERE id = $1', [fromTitle]);
-    await pathEmit(sessionId, 'node_ready', { node: nr.rows[0] || { id: fromTitle, title: fromTitle } });
-  } catch (e) {
-    await pathEmit(sessionId, 'warn', { msg: `Could not classify "${fromTitle}": ${e.message}` });
-  }
+  try { await classifyTitle(fromTitle); }
+  catch (e) { await pathEmit(sessionId, 'warn', { msg: `Could not classify "${fromTitle}": ${e.message}` }); }
+  const fromRow = await pool.query('SELECT * FROM nodes WHERE id = $1', [fromTitle]);
+  await pathEmit(sessionId, 'node_ready', {
+    node: fromRow.rows[0] || { id: fromTitle, title: fromTitle },
+    role: 'from',
+  });
 
+  // ── 2. Classify TO ──────────────────────────────────────────────────
   await pathEmit(sessionId, 'status', { msg: `Classifying "${toTitle}"...` });
-  try {
-    await classifyTitle(toTitle);
-    const nr = await pool.query('SELECT * FROM nodes WHERE id = $1', [toTitle]);
-    await pathEmit(sessionId, 'node_ready', { node: nr.rows[0] || { id: toTitle, title: toTitle } });
-  } catch (e) {
-    await pathEmit(sessionId, 'warn', { msg: `Could not classify "${toTitle}": ${e.message}` });
+  try { await classifyTitle(toTitle); }
+  catch (e) { await pathEmit(sessionId, 'warn', { msg: `Could not classify "${toTitle}": ${e.message}` }); }
+  const toRow = await pool.query('SELECT * FROM nodes WHERE id = $1', [toTitle]);
+  await pathEmit(sessionId, 'node_ready', {
+    node: toRow.rows[0] || { id: toTitle, title: toTitle },
+    role: 'to',
+  });
+
+  // ── 3. Load typed edges ─────────────────────────────────────────────
+  await pathEmit(sessionId, 'status', { msg: 'Mapping connections...' });
+  const [fromEdges, toEdges] = await Promise.all([
+    getNodeEdges(fromTitle),
+    getNodeEdges(toTitle),
+  ]);
+
+  // ── 4. Emit FROM branches (paced for client animation) ──────────────
+  for (const e of fromEdges) {
+    await pathEmit(sessionId, 'branch', {
+      from: e.from_node, to: e.to_node,
+      edge_type: e.edge_type, predicate: e.predicate || '',
+      source: e.edge_source, side: 'from',
+    });
+    await sleep(45);
   }
 
-  /* Step 2: typed paths (fast DB BFS) */
-  await pathEmit(sessionId, 'status', { msg: 'Searching typed relationship paths...' });
-  let foundCount = 0;
-  try {
-    const typedPaths = await findTypedPaths(fromTitle, toTitle);
-    for (const [pathType, path] of Object.entries(typedPaths)) {
-      if (path) {
-        await pathEmit(sessionId, 'path_found', { path_type: pathType, nodes: path.nodes, edges: path.edges });
-        foundCount++;
+  // ── 5. Emit TO branches ─────────────────────────────────────────────
+  for (const e of toEdges) {
+    await pathEmit(sessionId, 'branch', {
+      from: e.from_node, to: e.to_node,
+      edge_type: e.edge_type, predicate: e.predicate || '',
+      source: e.edge_source, side: 'to',
+    });
+    await sleep(45);
+  }
+
+  // ── 6. Find 1-hop paths: shared ghost neighbors ─────────────────────
+  await pathEmit(sessionId, 'status', { msg: 'Finding connections...' });
+
+  // Map: ghost_title -> all FROM edges that point to it
+  const fromMap = new Map();
+  for (const e of fromEdges) {
+    if (!fromMap.has(e.to_node)) fromMap.set(e.to_node, []);
+    fromMap.get(e.to_node).push(e);
+  }
+
+  let found = 0;
+  for (const te of toEdges) {
+    if (fromMap.has(te.to_node)) {
+      for (const fe of fromMap.get(te.to_node)) {
+        await pathEmit(sessionId, 'path_found', {
+          path_type: fe.edge_type,
+          via:       te.to_node,
+          nodes:     [fromTitle, te.to_node, toTitle],
+          edges:     [fe, te],
+          hops:      1,
+        });
+        found++;
       }
     }
-  } catch (e) {
-    await pathEmit(sessionId, 'warn', { msg: `Typed path search error: ${e.message}` });
   }
 
-  /* Step 3: structural path via Wikipedia link BFS */
-  await pathEmit(sessionId, 'status', { msg: 'Searching Wikipedia link structure...' });
-  try {
-    const structPath = await wikiStructuralPath(fromTitle, toTitle);
-    if (structPath) {
-      for (const title of structPath.slice(1, -1)) {
-        try {
-          await classifyTitle(title);
-          const nr = await pool.query('SELECT * FROM nodes WHERE id = $1', [title]);
-          await pathEmit(sessionId, 'node_ready', { node: nr.rows[0] || { id: title, title } });
-        } catch {}
+  // ── 7. Find 2-hop paths through already-classified intermediaries ────
+  const classifiedRes = await pool.query(
+    `SELECT id FROM nodes WHERE classified = true AND id NOT IN ($1, $2)`,
+    [fromTitle, toTitle]
+  );
+  for (const { id: mid } of classifiedRes.rows) {
+    const midEdges   = await getNodeEdges(mid);
+    const midTargets = new Set(midEdges.map(e => e.to_node));
+
+    const connectsFrom = fromEdges.some(e => e.to_node === mid) || midTargets.has(fromTitle);
+    const connectsTo   = toEdges.some(e => e.to_node === mid)   || midTargets.has(toTitle);
+
+    if (connectsFrom && connectsTo) {
+      const fe = fromEdges.find(e => e.to_node === mid) || midEdges.find(e => e.to_node === fromTitle);
+      const te = toEdges.find(e => e.to_node === mid)   || midEdges.find(e => e.to_node === toTitle);
+      const midNodeRow = await pool.query('SELECT * FROM nodes WHERE id = $1', [mid]);
+      if (midNodeRow.rowCount > 0) {
+        await pathEmit(sessionId, 'node_ready', { node: midNodeRow.rows[0], role: 'intermediate' });
       }
-      await pathEmit(sessionId, 'path_found', { path_type: 'structural', nodes: structPath, edges: [] });
-      foundCount++;
+      await pathEmit(sessionId, 'path_found', {
+        path_type: fe?.edge_type || 'categorical',
+        via:   mid,
+        nodes: [fromTitle, mid, toTitle],
+        edges: [fe, te].filter(Boolean),
+        hops:  2,
+      });
+      found++;
     }
-  } catch (e) {
-    await pathEmit(sessionId, 'warn', { msg: `Structural path error: ${e.message}` });
   }
 
-  await pathEmit(sessionId, 'complete', { found: foundCount, from: fromTitle, to: toTitle });
+  // ── 8. Queue all ghost nodes for future classification ───────────────
+  const classifiedSet = new Set([fromTitle, toTitle, ...classifiedRes.rows.map(r => r.id)]);
+  const allGhosts = [...new Set([
+    ...fromEdges.map(e => e.to_node),
+    ...toEdges.map(e => e.to_node),
+  ])].filter(g => !classifiedSet.has(g));
+
+  let queued = 0;
+  for (const ghost of allGhosts) {
+    try {
+      const r = await pool.query(
+        `INSERT INTO frontier (id, title, added_at)
+         VALUES ($1, $2, NOW()) ON CONFLICT (id) DO NOTHING RETURNING id`,
+        [ghost, ghost]
+      );
+      if (r.rowCount > 0) queued++;
+    } catch {}
+  }
+
+  const summary = found > 0
+    ? `${found} connection${found !== 1 ? 's' : ''} found — ${queued} articles queued for deeper paths`
+    : `No direct connections yet — ${queued} articles queued for future classification`;
+
+  await pathEmit(sessionId, 'status',   { msg: summary });
+  await pathEmit(sessionId, 'complete', { found, queued, from: fromTitle, to: toTitle });
 }
 
 /* Worker: pulls one session from queue and runs it */
