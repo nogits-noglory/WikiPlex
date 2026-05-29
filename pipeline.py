@@ -1031,7 +1031,7 @@ def backfill_images():
                         dim(f"  {node_id}: no thumbnail")
                 else:
                     dim(f"  {node_id}: HTTP {resp.status_code}")
-                time.sleep(0.4)  # stay well under rate limits
+                time.sleep(1.1)  # Wikipedia REST API: ~1 req/s sustained
             except Exception as e:
                 warn(f"  {node_id}: {e}")
         log(f"Updated {updated}/{len(rows)} nodes with thumbnails.", GOLD)
