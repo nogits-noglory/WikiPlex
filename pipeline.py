@@ -309,6 +309,64 @@ def load_graph() -> dict:
 def save_graph(graph: dict):
     GRAPH_PATH.write_text(json.dumps(graph, indent=2, ensure_ascii=False), encoding="utf-8")
 
+# --- Images ---
+def fetch_best_thumbnail(title: str, headers: dict) -> str | None:
+    """Try multiple sources for the best image for a Wikipedia article.
+
+    Priority order:
+      1. Wikipedia pageimages API (already in fetch_wikipedia, passed in)
+      2. Wikimedia REST summary endpoint (different cache, often works when API is slow)
+      3. Wikidata P18 image property (covers many entities with no Wikipedia thumbnail)
+    """
+    import urllib.parse as _ul
+
+    # Source 2: Wikimedia REST summary (lightweight, different rate limit pool)
+    try:
+        encoded = _ul.quote(title.replace(" ", "_"), safe="")
+        resp = requests.get(
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}",
+            headers=headers, timeout=8
+        )
+        if resp.status_code == 200:
+            thumb = resp.json().get("thumbnail", {}).get("source")
+            if thumb:
+                return thumb
+    except Exception:
+        pass
+
+    # Source 3: Wikidata P18 image property
+    # Step 3a: resolve Wikipedia title to Wikidata QID via Wikipedia API
+    try:
+        wd_resp = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "titles": title, "prop": "pageprops",
+                    "ppprop": "wikibase_item", "redirects": 1,
+                    "format": "json", "origin": "*"},
+            headers=headers, timeout=8
+        )
+        if wd_resp.status_code == 200:
+            pages = list(wd_resp.json().get("query", {}).get("pages", {}).values())
+            qid = pages[0].get("pageprops", {}).get("wikibase_item") if pages else None
+            if qid:
+                # Step 3b: fetch Wikidata entity JSON and extract P18 (image filename)
+                ent_resp = requests.get(
+                    f"https://www.wikidata.org/wiki/Special:EntityData/{qid}.json",
+                    headers=headers, timeout=8
+                )
+                if ent_resp.status_code == 200:
+                    ent = ent_resp.json().get("entities", {}).get(qid, {})
+                    claims = ent.get("claims", {})
+                    p18 = claims.get("P18", [])
+                    if p18:
+                        filename = p18[0]["mainsnak"]["datavalue"]["value"]
+                        encoded_fn = _ul.quote(filename.replace(" ", "_"), safe="")
+                        # Wikimedia Commons thumbnail URL formula
+                        return f"https://commons.wikimedia.org/wiki/Special:FilePath/{encoded_fn}?width=300"
+    except Exception:
+        pass
+
+    return None
+
 # --- Wikipedia ---
 def verify_wiki_title(title: str):
     """Check if a Wikipedia article exists. Returns canonical title string or None."""
@@ -371,6 +429,10 @@ def fetch_wikipedia(title: str) -> dict:
     word_count = len(article_text.split())
 
     thumbnail_url = page.get("thumbnail", {}).get("source") or None
+    # Fallback: try Wikimedia REST + Wikidata if pageimages returned nothing
+    if not thumbnail_url:
+        headers = {"User-Agent": "WikiFold/0.1 (learning graph project)"}
+        thumbnail_url = fetch_best_thumbnail(page["title"], headers)
 
     return {
         "title":          page["title"],
@@ -997,8 +1059,7 @@ SEED_ARTICLES = [
 
 def backfill_images():
     """Fetch thumbnail_url for all classified nodes that currently have none.
-    Uses the lightweight REST summary endpoint — no full article fetch needed."""
-    import urllib.parse as _ul
+    Tries Wikipedia REST, then Wikidata P18 as fallback."""
     conn = get_db_conn()
     if not conn:
         err("No DB connection for backfill-images")
@@ -1013,25 +1074,17 @@ def backfill_images():
         updated = 0
         for (node_id,) in rows:
             try:
-                encoded = _ul.quote(node_id.replace(" ", "_"), safe="")
-                resp = requests.get(
-                    f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}",
-                    headers=headers, timeout=8
-                )
-                if resp.status_code == 200:
-                    thumb = resp.json().get("thumbnail", {}).get("source")
-                    if thumb:
-                        c2 = conn.cursor()
-                        c2.execute("UPDATE nodes SET thumbnail_url = %s WHERE id = %s", (thumb, node_id))
-                        c2.close()
-                        conn.commit()
-                        ok(f"  {node_id}")
-                        updated += 1
-                    else:
-                        dim(f"  {node_id}: no thumbnail")
+                thumb = fetch_best_thumbnail(node_id, headers)
+                if thumb:
+                    c2 = conn.cursor()
+                    c2.execute("UPDATE nodes SET thumbnail_url = %s WHERE id = %s", (thumb, node_id))
+                    c2.close()
+                    conn.commit()
+                    ok(f"  {node_id}")
+                    updated += 1
                 else:
-                    dim(f"  {node_id}: HTTP {resp.status_code}")
-                time.sleep(1.1)  # Wikipedia REST API: ~1 req/s sustained
+                    dim(f"  {node_id}: no image found")
+                time.sleep(1.2)
             except Exception as e:
                 warn(f"  {node_id}: {e}")
         log(f"Updated {updated}/{len(rows)} nodes with thumbnails.", GOLD)

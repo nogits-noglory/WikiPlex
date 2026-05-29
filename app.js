@@ -113,7 +113,7 @@ function edgeColor(e) {
 function isRichEdge(d) {
   return d._src === 'ai_inference' || d._src === 'embedding_similarity';
 }
-function nodeRadius(d) { return d.thumbnail_url ? 28 : 6 + (d.depth_score || 3) * 1.8; }
+function nodeRadius(d) { return d.thumbnail_url ? 22 : 6 + (d.depth_score || 3) * 1.8; }
 function nodePatternId(id) { return 'nip-' + id.replace(/[^a-z0-9]/gi, '_').slice(0, 60); }
 
 function $(id) { return document.getElementById(id); }
@@ -269,9 +269,11 @@ svg.on('click', e => {
 
 window.addEventListener('resize', () => {
   if (simulation) {
-    const cx = graphCenterX();
-    simulation.force('center', d3.forceCenter(cx, H()/2).strength(0.05));
-    simulation.alpha(0.1).restart();
+    const cx = graphCenterX(), cy = H()/2;
+    simulation.force('center', d3.forceCenter(cx, cy).strength(0.008));
+    const radial = simulation.force('ghost_radial');
+    if (radial) radial.x(cx).y(cy);
+    simulation.alpha(0.3).restart();
   }
 });
 
@@ -289,55 +291,59 @@ function nudgeGraph(panelOpen) {
   simulation.alpha(0.35).restart();
 }
 
-const GHOST_RING_R = () => Math.min(graphCenterX(), H() / 2) * 0.82;
+// Ring radius: 88% of the smaller viewport half — leaves a thin margin
+const GHOST_RING_R = () => Math.min(graphCenterX(), H() / 2) * 0.88;
+// Classified nodes spread across 55% of the smaller half
+const CLUSTER_R    = () => Math.min(graphCenterX(), H() / 2) * 0.55;
 
 function makeSimulation() {
   return d3.forceSimulation()
     .force('link', d3.forceLink()
       .id(d => d.id)
       .distance(d => {
-        if (d._ghost_edge) return GHOST_RING_R() * 1.05; // tether length matches ring radius
-        if (d._src === 'embedding_similarity') return 160;
-        if (d._src === 'ai_inference')         return 120;
-        return 260;
+        if (d._ghost_edge)                     return GHOST_RING_R() * 1.1;
+        if (d._src === 'embedding_similarity') return 220;
+        if (d._src === 'ai_inference')         return 180;
+        return 300; // structural fallback edges between classified nodes
       })
       .strength(d => {
-        if (d._ghost_edge) return 0.006; // almost no pull — radial force owns position
-        if (d._src === 'embedding_similarity') return 0.30;
-        if (d._src === 'ai_inference')         return 0.55;
-        return 0.08;
+        if (d._ghost_edge)                     return 0.004;
+        if (d._src === 'embedding_similarity') return 0.20;
+        if (d._src === 'ai_inference')         return 0.40;
+        return 0.05;
       })
     )
     .force('charge', d3.forceManyBody()
       .strength(d => d.ghost
-        ? -12   // minimal — just enough to prevent stacking on the ring
-        : -(320 + (d.depth_score || 3) * 32))
-      .distanceMax(d => d.ghost ? 80 : 600)
+        ? -10
+        : -(500 + (d.depth_score || 3) * 50))  // stronger repulsion — fills the viewport
+      .distanceMax(d => d.ghost ? 80 : 1400)    // classified nodes repel across the whole canvas
     )
     .force('collide', d3.forceCollide()
-      .radius(d => (d.ghost ? 10 : nodeRadius(d)) + (d.ghost ? 12 : 24))
+      .radius(d => (d.ghost ? 8 : nodeRadius(d)) + (d.ghost ? 10 : 28))
       .iterations(3)
     )
-    .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.04))
-    // Dominant radial force — ghosts snap to GHOST_RING_R from center
+    // Very weak center gravity — just stops nodes flying off-screen
+    .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.008))
+    // Classified nodes spread to CLUSTER_R by domain angle
+    .force('domain_x', d3.forceX(d => {
+      if (d.ghost) return graphCenterX();
+      const idx   = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
+      const total = Object.keys(DOMAIN_COLOR).length;
+      return graphCenterX() + Math.cos((idx / total) * 2 * Math.PI) * CLUSTER_R();
+    }).strength(d => d.ghost ? 0 : 0.06))
+    .force('domain_y', d3.forceY(d => {
+      if (d.ghost) return H() / 2;
+      const idx   = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
+      const total = Object.keys(DOMAIN_COLOR).length;
+      return H() / 2 + Math.sin((idx / total) * 2 * Math.PI) * CLUSTER_R();
+    }).strength(d => d.ghost ? 0 : 0.06))
+    // Ghost nodes locked to outer ring
     .force('ghost_radial', d3.forceRadial(
       d => d.ghost ? GHOST_RING_R() : 0,
       graphCenterX(), H()/2
     ).strength(d => d.ghost ? 0.92 : 0))
-    // Domain-clustering for classified nodes only
-    .force('domain_x', d3.forceX(d => {
-      if (d.ghost) return graphCenterX();
-      const domainIndex = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
-      const angle = (domainIndex / Object.keys(DOMAIN_COLOR).length) * 2 * Math.PI;
-      return graphCenterX() + Math.cos(angle) * 140;
-    }).strength(d => d.ghost ? 0 : 0.04))
-    .force('domain_y', d3.forceY(d => {
-      if (d.ghost) return H() / 2;
-      const domainIndex = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
-      const angle = (domainIndex / Object.keys(DOMAIN_COLOR).length) * 2 * Math.PI;
-      return H() / 2 + Math.sin(angle) * 140;
-    }).strength(d => d.ghost ? 0 : 0.04))
-    .alphaDecay(0.018);
+    .alphaDecay(0.015);
 }
 
 /* ── Load graph from API ── */
@@ -363,11 +369,28 @@ async function loadGraph() {
   const allEdges = (data.edges || []);
 
   // ── Classified↔Classified edges:
-  //    Only show rich (non-structural) edges between classified nodes.
-  //    Raw "links to" structural edges are pure visual noise at scale.
+  //    Prefer rich (ai_inference / embedding) edges.
+  //    For any classified node with NO rich edges, fall back to its single
+  //    strongest structural link to another classified node — no orphans.
   const richClassifiedEdges = allEdges.filter(e =>
     nodeIds.has(e.from) && nodeIds.has(e.to) && e.source !== 'wikipedia_links'
   );
+  const connectedIds = new Set();
+  richClassifiedEdges.forEach(e => { connectedIds.add(e.from); connectedIds.add(e.to); });
+  const orphans = [...nodeIds].filter(id => !connectedIds.has(id));
+  if (orphans.length > 0) {
+    const orphanBestEdge = new Map();
+    allEdges.forEach(e => {
+      if (e.source !== 'wikipedia_links') return;
+      if (!nodeIds.has(e.from) || !nodeIds.has(e.to)) return;
+      const orphanId = orphans.includes(e.from) ? e.from
+                     : orphans.includes(e.to)   ? e.to : null;
+      if (!orphanId) return;
+      const prev = orphanBestEdge.get(orphanId);
+      if (!prev || (e.weight||0) > (prev.weight||0)) orphanBestEdge.set(orphanId, e);
+    });
+    orphanBestEdge.forEach(e => richClassifiedEdges.push(e));
+  }
 
   // ── Ghost (frontier) nodes — two tiers, hard-capped for a clean ring:
   //
