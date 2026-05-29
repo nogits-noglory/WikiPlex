@@ -67,7 +67,7 @@ body {
   inset: 0;
   width: 100vw;
   height: 100vh;
-  background: radial-gradient(ellipse 130% 100% at 50% 35%, #080e18 0%, #050912 55%, #020508 100%);
+  background: radial-gradient(ellipse 120% 120% at 50% 30%, #ffffff 0%, #e8f4ff 35%, #cce0f8 70%, #b8d0ee 100%);
   cursor: grab;
   z-index: 0;
   touch-action: none;
