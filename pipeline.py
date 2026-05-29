@@ -392,8 +392,8 @@ def fetch_wikipedia(title: str) -> dict:
     base = "https://en.wikipedia.org/w/api.php"
     params_text = {
         "action": "query", "titles": title,
-        "prop": "extracts|pageimages", "exintro": False,
-        "explaintext": True, "redirects": 1,
+        "prop": "extracts|pageimages",
+        "explaintext": 1, "redirects": 1,
         "pithumbsize": 300, "piprop": "thumbnail",
         "format": "json", "origin": "*"
     }
@@ -422,8 +422,8 @@ def fetch_wikipedia(title: str) -> dict:
     if len(article_text) < 100:
         raise ValueError(f'Article "{title}" is too short to classify')
 
-    truncated = article_text[:10000] + "\n[article truncated]" \
-        if len(article_text) > 10000 else article_text
+    truncated = article_text[:20000] + "\n[article truncated]" \
+        if len(article_text) > 20000 else article_text
 
     outbound_links = [l["title"] for l in links_pages[0].get("links", [])]
     word_count = len(article_text.split())
