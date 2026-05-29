@@ -74,7 +74,7 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
-.node { cursor: pointer; touch-action: none; }
+.node { cursor: pointer; touch-action: none; transition: opacity 0.22s ease; }
 #graph-svg:active { cursor: grabbing; }
 
 .node { cursor: pointer; }
@@ -94,9 +94,19 @@ body {
 .node.selected .node-glow { opacity: 0.6 !important; }
 .node.selected .node-main  { stroke: #ffffff; stroke-width: 2.5; }
 
-.edge-visual { transition: stroke-opacity 0.12s, stroke-width 0.12s; }
-.edge-visual.hovered  { stroke-opacity: 1 !important; stroke-width: 2.5px !important; }
-.edge-visual.faded    { stroke-opacity: 0.04 !important; }
+/* Hover: dim non-neighbor nodes */
+.node.nb-dim { opacity: 0.1 !important; }
+
+/* Spotlight (panel open on a node): deep dim everything non-connected */
+#graph-svg.spotlight .node:not(.selected) { opacity: 0.08 !important; }
+
+.edge-visual { transition: stroke-opacity 0.18s, stroke-width 0.18s; }
+.edge-visual.hovered   { stroke-opacity: 1 !important;    stroke-width: 2.5px !important; }
+.edge-visual.faded     { stroke-opacity: 0.04 !important; }
+/* Spotlight: connected edges reveal fully; non-connected stay dark */
+.edge-visual.connected { stroke-opacity: 1 !important;    stroke-width: 2.2px !important; }
+#graph-svg.spotlight .edge-visual:not(.connected):not(.hovered) { stroke-opacity: 0.03 !important; }
+
 .edge-hit { cursor: default; }
 .edge-hit.clickable   { cursor: pointer; }
 

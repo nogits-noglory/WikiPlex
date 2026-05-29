@@ -872,34 +872,78 @@ function refreshNodeState(id) {
 }
 
 /* ── Selection / highlight ── */
-function selectNode(id) {
-  selectedNodeId = id;
-  nodeG.selectAll('g.node').classed('selected', d => d.id === id);
-}
-function deselect() {
-  selectedNodeId = null;
-  nodeG.selectAll('g.node').classed('selected', false);
-  edgeVisG.selectAll('line.ev').classed('faded',false).classed('hovered',false);
+/* ── Neighbor set helper ── */
+function _neighborSet(id) {
+  const nbrs = new Set([id]);
+  gLinks.forEach(l => {
+    const s = typeof l.source === 'object' ? l.source.id : l.source;
+    const t = typeof l.target === 'object' ? l.target.id : l.target;
+    if (s === id) nbrs.add(t);
+    if (t === id) nbrs.add(s);
+  });
+  return nbrs;
 }
 
+/* ── Spotlight: full dim of non-connected nodes + edge reveal ── */
+function applySpotlight(id) {
+  const nbrs = _neighborSet(id);
+  nodeG.selectAll('g.node').classed('selected', d => nbrs.has(d.id));
+  edgeVisG.selectAll('line.ev')
+    .classed('connected', d => {
+      const s = typeof d.source === 'object' ? d.source.id : d.source;
+      const t = typeof d.target === 'object' ? d.target.id : d.target;
+      return s === id || t === id;
+    })
+    .classed('faded', d => {
+      const s = typeof d.source === 'object' ? d.source.id : d.source;
+      const t = typeof d.target === 'object' ? d.target.id : d.target;
+      return s !== id && t !== id;
+    });
+  svg.classed('spotlight', true);
+}
+
+function clearSpotlight() {
+  svg.classed('spotlight', false);
+  nodeG.selectAll('g.node').classed('selected', false).classed('nb-dim', false);
+  edgeVisG.selectAll('line.ev').classed('faded', false).classed('connected', false).classed('hovered', false);
+}
+
+function selectNode(id) {
+  selectedNodeId = id;
+  if (id) {
+    applySpotlight(id);
+  } else {
+    clearSpotlight();
+  }
+}
+
+function deselect() {
+  selectedNodeId = null;
+  clearSpotlight();
+}
+
+/* ── Hover: temporarily dim non-neighbors while mousing over a node ── */
 function highlightNeighbors(id, on) {
   if (on) {
-    const nbrs = new Set([id]);
-    gLinks.forEach(l => {
-      const s = typeof l.source === 'object' ? l.source.id : l.source;
-      const t = typeof l.target === 'object' ? l.target.id : l.target;
-      if (s===id) nbrs.add(t);
-      if (t===id) nbrs.add(s);
-    });
-    nodeG.selectAll('g.node').classed('selected', d => nbrs.has(d.id));
+    const nbrs = _neighborSet(id);
+    // Mark neighbors as selected (glow), dim everyone else
+    nodeG.selectAll('g.node')
+      .classed('selected', d => nbrs.has(d.id))
+      .classed('nb-dim',   d => !nbrs.has(d.id));
     edgeVisG.selectAll('line.ev').classed('faded', d => {
       const s = typeof d.source === 'object' ? d.source.id : d.source;
       const t = typeof d.target === 'object' ? d.target.id : d.target;
-      return s!==id && t!==id;
+      return s !== id && t !== id;
     });
-  } else if (!selectedNodeId) {
-    nodeG.selectAll('g.node').classed('selected', false);
-    edgeVisG.selectAll('line.ev').classed('faded', false);
+  } else {
+    // Mouse left: clear hover classes, restore spotlight if panel is open
+    nodeG.selectAll('g.node').classed('nb-dim', false);
+    if (selectedNodeId) {
+      applySpotlight(selectedNodeId);
+    } else {
+      nodeG.selectAll('g.node').classed('selected', false);
+      edgeVisG.selectAll('line.ev').classed('faded', false);
+    }
   }
 }
 
