@@ -509,8 +509,8 @@ Return exactly this structure:
       "object": "The target entity or concept",
       "object_is_link": true,
       "object_wiki_title": "Exact Wikipedia article title if object_is_link is true, else null",
-      "source_sentence": "The exact sentence from the article that supports this triple",
-      "edge_type": "interpersonal | geographical | temporal | categorical | etymological | positional | implication | misconception | analogy"
+      "source_sentence": "The sentence from the article that supports this triple, or null if drawing on widely-known background knowledge",
+      "edge_type": "interpersonal | geographical | temporal | categorical | etymological | positional | implication | misconception | analogy | influence | application"
     }}
   ],
 
@@ -556,11 +556,29 @@ RULES FOR classification:
 - era: Use "timeless" for mathematics, logic, natural laws.
 
 RULES FOR triples:
-- Extract 8 to 20 triples. Every triple must include source_sentence copied exactly from the text.
+- Extract 12 to 28 triples. Be thorough and think like a domain expert who knows this subject well.
+- source_sentence: copy the exact supporting sentence from the article text. If the relationship is common knowledge widely confirmed by Wikipedia but not stated in this excerpt, you may use null -- but this must be genuinely verifiable, not speculative.
 - object_wiki_title should be the exact Wikipedia article title for the object entity. Set it for ANY entity that plausibly has a Wikipedia article -- you are NOT limited to the outbound links list above. The outbound links are a hint, not a ceiling.
 - object_is_link should be true whenever you set object_wiki_title. Set it false only for abstract concepts that have no Wikipedia article (e.g. "the idea of justice", "an unnamed ancestor").
 - Never emit a triple where subject and object are the same article.
 - AIM TO USE EVERY EDGE TYPE FAMILY. Push yourself to find temporal, implication, analogy, influence, and application edges, not just categorical and geographical ones.
+
+THINK LIKE A DOMAIN EXPERT -- for every article, consider:
+- RIVALS & CONTEMPORARIES: What competed with this? What else existed at the same time? (analogy: "is analogous to", temporal: "contemporaneous with")
+- CHARACTERS & KEY FIGURES: Who are the most iconic people/characters associated with this? (positional: "stars", "depicts")
+- REAL-WORLD IMPACT: What did this cause, inspire, or regulate? What laws, organizations, or movements resulted from this? (implication: "historically led to", influence: "gave rise to")
+- ADAPTATIONS & SPIN-OFFS: Was this adapted into films, games, books, sequels? (positional: "created", influence: "gave rise to")
+- CREATORS & PUBLISHERS: Who made it? Who funded it? Who distributed it? (interpersonal: "created", positional: "founded")
+- PLATFORM & MEDIUM: What platform, genre, or medium does this belong to? (categorical: "type of", "part of")
+- PREDECESSOR & SUCCESSOR: What came before and after? (temporal: "preceded by", "succeeded by")
+- CONTROVERSIES & MISCONCEPTIONS: What is this commonly confused with? What challenged it? (misconception, implication: "challenged by")
+
+Examples of the kind of rich connections to extract:
+- For a VIDEO GAME: the game's franchise predecessors, rival franchises (Street Fighter vs Mortal Kombat), iconic characters (Sub-Zero for MK), the rating board it helped create (ESRB), the studio that made it, film adaptations, the genre it defines.
+- For a SCIENTIST: their major discoveries, rival theories, the institutions they led, the students they mentored, the era they worked in.
+- For a HISTORICAL EVENT: what caused it, what it resulted in, parallel events elsewhere, key figures involved, the era it occurred in.
+- For a SPECIES: its genus, its habitat, what predates it, what it competes with, conservation status organizations.
+
 - Use ONLY these predicates:
 
   INTERPERSONAL: married to, parent of, child of, sibling of, allied with, opposed by, mentored, mentored by, collaborated with, succeeded by, preceded by as leader
@@ -1467,6 +1485,20 @@ if __name__ == "__main__":
         # Fetch and store thumbnail_url for all classified nodes that lack one
         backfill_images()
 
+    elif "--enrich" in args:
+        # Re-classify one or more existing nodes with the current (improved) prompt.
+        # New edges accumulate in DB (DO NOTHING on duplicates, new rows inserted).
+        # Usage: python pipeline.py --enrich "Mortal Kombat"
+        #        python pipeline.py --enrich "Mortal Kombat" "DNA" "French Revolution"
+        enrich_titles = [a for a in args if not a.startswith("--")]
+        if not enrich_titles:
+            err("--enrich requires at least one article title.")
+            err('Usage: python pipeline.py --enrich "Article Title"')
+            sys.exit(1)
+        for t in enrich_titles:
+            log(f'Re-enriching: "{t}"', GOLD)
+            run(t)
+
     elif "--reseed" in args:
         # Add canonical high-quality articles to the frontier
         log("Seeding frontier with canonical articles...", GOLD)
@@ -1489,6 +1521,7 @@ if __name__ == "__main__":
         dim("python pipeline.py --reseed               add 30 canonical articles to the frontier")
         dim("python pipeline.py --repair-cross         re-run cross-edge inference for all nodes")
         dim("python pipeline.py --backfill-images      fetch thumbnails for nodes that have none")
+        dim('python pipeline.py --enrich "Title"       re-classify node(s) with improved prompt')
         print()
         title = input(f"{GOLD}  Article title (or press Enter for random): {RESET}").strip()
         if not title:

@@ -402,16 +402,55 @@ async function loadGraph() {
   //
   //  Total cap: ~55 ghost nodes → clean concentric ring.
 
-  // Count typed-edge references per unclassified target
-  const typedGhostCount = new Map();
+  // ── Typed ghost selection with domain-diversity cap ──────────────────────────
+  // Problem without this: if 14 football-stub nodes each have an edge to
+  // "Association football", it scores 14 and monopolizes the 40-slot budget.
+  // Fix: gather nomination info per ghost (unique source nodes + their domains),
+  // then limit each primary domain to MAX_PER_DOMAIN slots.
+  const MAX_TYPED_GHOSTS = 40;
+  const MAX_PER_DOMAIN   = 7;
+
+  // rawNodes is keyed by id and carries primary_domain
+  const ghostNoms = new Map(); // ghostId -> { count, sources: Set<id>, domains: Set<domain> }
   allEdges.forEach(e => {
-    if (nodeIds.has(e.from) && !nodeIds.has(e.to) && e.source !== 'wikipedia_links')
-      typedGhostCount.set(e.to, (typedGhostCount.get(e.to)||0)+1);
+    if (!nodeIds.has(e.from) || nodeIds.has(e.to) || e.source === 'wikipedia_links') return;
+    if (!ghostNoms.has(e.to)) ghostNoms.set(e.to, { count: 0, sources: new Set(), domains: new Set() });
+    const n = ghostNoms.get(e.to);
+    n.count++;
+    n.sources.add(e.from);
+    n.domains.add(rawNodes[e.from]?.primary_domain || 'other');
   });
-  // Top 40 by reference count; one best typed edge per ghost
-  const typedGhostIds = new Set(
-    [...typedGhostCount.entries()].sort((a,b)=>b[1]-a[1]).slice(0,40).map(([id])=>id)
-  );
+
+  // Sort by unique source-node count desc (raw count as tie-break)
+  const sortedGhostNoms = [...ghostNoms.entries()]
+    .sort((a, b) => b[1].sources.size - a[1].sources.size || b[1].count - a[1].count);
+
+  // Helper: pick most common domain among source nodes for a ghost
+  function primaryDomainFor(nom) {
+    const freq = new Map();
+    nom.domains.forEach(d => freq.set(d, (freq.get(d)||0) + 1));
+    return [...freq.entries()].sort((a,b) => b[1]-a[1])[0][0];
+  }
+
+  const domainUsed    = new Map();
+  const typedGhostIds = new Set();
+
+  // First pass: domain-capped selection
+  for (const [ghostId, nom] of sortedGhostNoms) {
+    if (typedGhostIds.size >= MAX_TYPED_GHOSTS) break;
+    const dom  = primaryDomainFor(nom);
+    const used = domainUsed.get(dom) || 0;
+    if (used < MAX_PER_DOMAIN) {
+      typedGhostIds.add(ghostId);
+      domainUsed.set(dom, used + 1);
+    }
+  }
+  // Second pass: fill remaining budget with highest-count uncapped ghosts
+  for (const [ghostId] of sortedGhostNoms) {
+    if (typedGhostIds.size >= MAX_TYPED_GHOSTS) break;
+    typedGhostIds.add(ghostId);
+  }
+
   const typedGhostBestEdge = new Map();
   allEdges.forEach(e => {
     if (!typedGhostIds.has(e.to) || !nodeIds.has(e.from) || e.source === 'wikipedia_links') return;
