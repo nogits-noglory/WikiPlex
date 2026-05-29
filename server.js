@@ -534,14 +534,14 @@ app.post('/api/classify', requireTrustedOrigin, rateLimit, async (req, res) => {
     const proc = spawn('python3', [PIPELINE_PATH, clean], {
       env: { ...process.env },
     });
-    let classifyStderr = '';
-    proc.stderr.on('data', d => { classifyStderr += d.toString().slice(0, 2000); });
-    proc.stdout.on('data', () => {});
+    let classifyOut = '';
+    proc.stdout.on('data', d => { classifyOut += d.toString().slice(0, 3000); });
+    proc.stderr.on('data', d => { classifyOut += d.toString().slice(0, 1000); });
     proc.on('close', code => {
       classifyingNow.delete(clean);
       if (code !== 0) {
         console.error(`classify pipeline exit ${code} for "${clean}"`);
-        if (classifyStderr) console.error('  stderr:', classifyStderr.slice(0, 500));
+        if (classifyOut) console.error('  output:', classifyOut.slice(-600));
       }
     });
     proc.on('error', err => {
