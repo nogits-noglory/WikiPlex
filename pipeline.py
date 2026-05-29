@@ -650,24 +650,25 @@ RULES FOR curriculum:
 # --- API call ---
 def call_api(system: str, user: str) -> str:
     resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
+        API_BASE + "/chat/completions",
         headers={
-            "x-api-key":         API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type":      "application/json",
+            "Authorization": f"Bearer {API_KEY}",
+            "content-type":  "application/json",
         },
         json={
             "model":      MODEL,
             "max_tokens": 12000,
-            "system":     system,
-            "messages":   [{"role": "user", "content": user}],
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
         },
-        timeout=120,
+        timeout=180,
     )
     if not resp.ok:
         data = resp.json()
         raise RuntimeError(f"LLM API {resp.status_code}: {data.get('error', {}).get('message', 'unknown')}")
-    return resp.json()["content"][0]["text"]
+    return resp.json()["choices"][0]["message"]["content"]
 
 # --- Parser ---
 def parse_response(raw: str) -> dict:
@@ -1444,12 +1445,13 @@ def fetch_random_title() -> str:
     resp.raise_for_status()
     return resp.json()["query"]["random"][0]["title"]
 
-# --- API key check ---
-API_KEY = os.getenv("LLM_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
-MODEL   = os.getenv("MODEL", "claude-haiku-4-5-20251001")
+# --- API config ---
+API_KEY  = os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
+API_BASE = os.getenv("LLM_API_BASE", "https://api.deepseek.com/v1")
+MODEL    = os.getenv("MODEL", "deepseek-chat")
 
 if not API_KEY:
-    print("\n  ERROR: LLM_API_KEY (or ANTHROPIC_API_KEY) not found in .env\n")
+    print("\n  ERROR: LLM_API_KEY (or DEEPSEEK_API_KEY) not found in .env\n")
     sys.exit(1)
 
 # --- Entry point ---
