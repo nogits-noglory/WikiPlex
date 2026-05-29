@@ -663,7 +663,7 @@ def call_api(system: str, user: str) -> str:
         },
         json={
             "model":      MODEL,
-            "max_tokens": 12000,
+            "max_tokens": 7000,
             "system":     system,
             "messages":   [{"role": "user", "content": user}],
         },
@@ -1359,27 +1359,11 @@ def run(input_title: str, force: bool = False):
             else:
                 warn("Embedding skipped (sentence-transformers not installed)")
 
-            # Step 10b: Cross-node edge inference
-            log("Generating cross-node edges...", SILVER)
-            conn2 = get_db_conn()
-            if conn2:
-                try:
-                    cross_edges = generate_cross_edges(wiki["title"], wiki["text"], conn2)
-                    if cross_edges:
-                        db_write_edges(conn2, cross_edges)
-                        conn2.commit()
-                        # Also add to graph.json
-                        for e in cross_edges:
-                            key = (e["from"], e["to"], e["type"])
-                            if key not in existing_edge_keys:
-                                graph["edges"].append(e)
-                                existing_edge_keys.add(key)
-                        save_graph(graph)
-                except Exception as e:
-                    warn(f"Cross-edge step failed: {e}")
-                    conn2.rollback()
-                finally:
-                    conn2.close()
+            # Step 10b: Cross-node edge inference — disabled.
+            # LLM-inferred cross-edges produce overly loose connections (slippery-slope
+            # influence chains) and double the API cost per classification.
+            # Semantic embedding similarity (step 10a) already handles real inter-article
+            # connections using cosine distance, which is a stronger signal.
 
         except Exception as e:
             err(f"PostgreSQL write failed: {e}")
