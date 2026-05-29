@@ -1107,12 +1107,11 @@ function updateStats(meta) {
 /* ── Add node live (from SSE) ── */
 function addNodeLive(node) {
   if (rawNodes[node.id]) return;
-  rawNodes[node.id] = node;
-  const pos = { x: WORLD_CX + (Math.random()-.5)*300, y: WORLD_CY + (Math.random()-.5)*300 };
-  gNodes.push({ ...node, ...pos });
-  renderGraph();
+  // Mark immediately to prevent duplicate loads if events arrive quickly
+  rawNodes[node.id] = true;
   showToast(`+ ${node.title}`);
-  $('stat-nodes').textContent = gNodes.length;
+  // Reload the full graph so the new node appears with its edges and ghost ring
+  loadGraph();
 }
 
 /* ── SSE connection ── */
