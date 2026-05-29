@@ -658,7 +658,7 @@ def call_api(system: str, user: str) -> str:
         },
         json={
             "model":      MODEL,
-            "max_tokens": 8000,
+            "max_tokens": 12000,
             "system":     system,
             "messages":   [{"role": "user", "content": user}],
         },
