@@ -703,10 +703,18 @@ def parse_response(raw: str) -> dict:
     if not isinstance(parsed["triples"], list):
         parsed["triples"] = []
 
+    # source_sentence is intentionally optional (null for background-knowledge triples).
+    # Only require the three structural fields: subject, predicate, object.
     parsed["triples"] = [
         t for t in parsed["triples"]
-        if t.get("subject") and t.get("predicate") and t.get("object") and t.get("source_sentence")
+        if t.get("subject") and t.get("predicate") and t.get("object")
     ]
+
+    if len(parsed["triples"]) < 5:
+        raise ValueError(
+            f"LLM returned only {len(parsed['triples'])} valid triples (minimum 5). "
+            "Response quality too low — will not save a near-edgeless node."
+        )
 
     for t in parsed["triples"]:
         if t.get("edge_type") not in valid_types_edge:
@@ -1151,10 +1159,36 @@ def run(input_title: str, force: bool = False):
 
     graph = load_graph()
 
-    if graph["nodes"].get(input_title, {}).get("classified") and not force:
+    # Check "already classified" against the DB (authoritative) rather than
+    # graph.json which can be stale from a previous session or concurrent run.
+    _already = False
+    _db_node  = None
+    try:
+        _conn = get_db_conn()
+        if _conn:
+            _cur = _conn.cursor()
+            _cur.execute(
+                "SELECT title, primary_domain, depth_score, weird_factor, shareability_score "
+                "FROM nodes WHERE id = %s AND classified = true",
+                (input_title,)
+            )
+            _row = _cur.fetchone()
+            if _row:
+                _already = True
+                _db_node = dict(zip(
+                    ["title","primary_domain","depth_score","weird_factor","shareability_score"],
+                    _row
+                ))
+            _conn.close()
+    except Exception:
+        # Fall back to graph.json if DB unavailable
+        _already = graph["nodes"].get(input_title, {}).get("classified", False)
+
+    if _already and not force:
         warn(f'"{input_title}" is already in the graph.')
-        dim("Delete the node from graph.json to reclassify, or use --enrich to re-run with current prompt.")
-        print_node(graph["nodes"][input_title])
+        dim("Use --enrich to re-classify with the current prompt.")
+        if _db_node:
+            print_node(_db_node)
         return
 
     # Step 1: Fetch
