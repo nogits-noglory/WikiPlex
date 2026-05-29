@@ -9,6 +9,9 @@ require('dotenv').config();
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust the nginx reverse proxy so req.ip is the real client IP, not 127.0.0.1
+app.set('trust proxy', 1);
+
 /* ── PostgreSQL pool ─────────────────────────────────────────────── */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL ||
@@ -76,6 +79,93 @@ setInterval(() => {
 const allowedOrigin = process.env.ALLOWED_ORIGIN || '*';
 app.use(cors({ origin: allowedOrigin }));
 app.use(express.json({ limit: '512kb' }));
+
+/* ── API request logging ─────────────────────────────────────────── *
+ * Every request is logged to api_log with real client IP, path,
+ * status code, and origin/referer. Rows older than 90 days are pruned
+ * daily. View recent logs via GET /api/admin/logs with ADMIN_KEY.
+ * ─────────────────────────────────────────────────────────────────── */
+(async () => {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS api_log (
+        id         BIGSERIAL PRIMARY KEY,
+        ts         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        ip         TEXT,
+        method     TEXT,
+        path       TEXT,
+        status     INT,
+        body_bytes INT,
+        ua         TEXT,
+        origin     TEXT,
+        referer    TEXT
+      )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_api_log_ts ON api_log (ts DESC)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_api_log_ip ON api_log (ip)`);
+  } catch (e) { console.error('api_log init error:', e.message); }
+})();
+
+// Prune logs older than 90 days, once per day
+setInterval(async () => {
+  try { await pool.query(`DELETE FROM api_log WHERE ts < NOW() - INTERVAL '90 days'`); }
+  catch {}
+}, 24 * 60 * 60 * 1000);
+
+app.use((req, res, next) => {
+  res.on('finish', () => {
+    pool.query(
+      `INSERT INTO api_log (ip, method, path, status, body_bytes, ua, origin, referer)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [
+        req.ip || 'unknown',
+        req.method,
+        req.path.slice(0, 200),
+        res.statusCode,
+        parseInt(req.headers['content-length'] || '0') || null,
+        (req.headers['user-agent']  || '').slice(0, 300),
+        (req.headers['origin']      || '').slice(0, 200),
+        (req.headers['referer']     || '').slice(0, 500),
+      ]
+    ).catch(() => {});
+  });
+  next();
+});
+
+/* ── Origin enforcement for expensive/write endpoints ───────────────
+ * If ALLOWED_ORIGIN is set to a real domain (not *), any POST to
+ * /api/generate, /api/pathfind, or /api/classify that arrives with an
+ * Origin header that does not match is rejected 403.
+ *
+ * Requests with no Origin header (curl, server-side) are blocked too
+ * unless the request also carries X-Admin-Key matching ADMIN_KEY.
+ * ─────────────────────────────────────────────────────────────────── */
+const TRUSTED_ORIGINS = allowedOrigin === '*'
+  ? null  // null = wildcard, no enforcement
+  : allowedOrigin.split(',').map(s => s.trim()).filter(Boolean);
+
+function requireTrustedOrigin(req, res, next) {
+  if (!TRUSTED_ORIGINS) return next(); // wildcard mode — no enforcement
+
+  const origin   = req.headers['origin']       || '';
+  const adminKey = req.headers['x-admin-key']  || '';
+
+  // Requests with a valid admin key bypass origin check (server-side tools)
+  if (process.env.ADMIN_KEY && adminKey === process.env.ADMIN_KEY) return next();
+
+  if (!origin) {
+    // No Origin header: could be a direct API probe. Block unless referer matches.
+    const referer = req.headers['referer'] || '';
+    const ok = TRUSTED_ORIGINS.some(o => referer.startsWith(o));
+    if (!ok) return res.status(403).json({ error: 'Forbidden' });
+    return next();
+  }
+
+  if (!TRUSTED_ORIGINS.includes(origin)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+}
 
 /* ────────────────────────────────────────────────────────────────── */
 /*  GRAPH API                                                         */
@@ -332,7 +422,11 @@ function sanitizeInput(str) {
 
 const SYSTEM_PROMPT = 'You are an expert curriculum designer. You ALWAYS respond with valid JSON only — no markdown fences, no preamble, no trailing text.';
 
-app.post('/api/generate', rateLimit, async (req, res) => {
+app.post('/api/generate', requireTrustedOrigin, rateLimit, async (req, res) => {
+  if (process.env.GENERATE_ENABLED === 'false') {
+    return res.status(503).json({ error: 'Service disabled' });
+  }
+
   const { user, maxTokens = 7000 } = req.body;
   const unknownKeys = Object.keys(req.body).filter(k => !['user', 'maxTokens'].includes(k));
   if (unknownKeys.length > 0) return res.status(400).json({ error: 'Unexpected fields in request' });
@@ -387,7 +481,7 @@ app.post('/api/generate', rateLimit, async (req, res) => {
 /* ── POST /api/classify ──────────────────────────────────────────── *
  * Queues a Wikipedia article for classification into the graph.
  * ─────────────────────────────────────────────────────────────────── */
-app.post('/api/classify', rateLimit, async (req, res) => {
+app.post('/api/classify', requireTrustedOrigin, rateLimit, async (req, res) => {
   const { title } = req.body;
   if (!title || typeof title !== 'string' || title.trim().length < 1) {
     return res.status(400).json({ error: 'Missing or invalid title' });
@@ -727,7 +821,7 @@ async function startPathWorker() {
 })();
 
 /* ── POST /api/pathfind ───────────────────────────────────────────── */
-app.post('/api/pathfind', rateLimit, async (req, res) => {
+app.post('/api/pathfind', requireTrustedOrigin, rateLimit, async (req, res) => {
   const { from, to } = req.body;
   if (!from || !to || typeof from !== 'string' || typeof to !== 'string') {
     return res.status(400).json({ error: 'from and to required' });
@@ -819,6 +913,67 @@ app.get('/api/pathfind/status/:sessionId', async (req, res) => {
   } catch (err) {
     console.error('/api/pathfind/status error:', err.message);
     res.status(500).json({ error: 'DB error' });
+  }
+});
+
+/* ── GET /api/admin/logs ─────────────────────────────────────────── *
+ * Returns recent API log entries. Requires X-Admin-Key header or
+ * ?key= query param matching ADMIN_KEY in .env
+ * Optional: ?limit=200&ip=1.2.3.4&path=/api/generate
+ * ─────────────────────────────────────────────────────────────────── */
+app.get('/api/admin/logs', async (req, res) => {
+  const provided = req.headers['x-admin-key'] || req.query.key || '';
+  if (!process.env.ADMIN_KEY || provided !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const limit  = Math.min(parseInt(req.query.limit  || '200', 10), 2000);
+  const ipFilt = req.query.ip   || null;
+  const pfFilt = req.query.path || null;
+
+  try {
+    let q      = `SELECT id, ts, ip, method, path, status, body_bytes, ua, origin, referer
+                  FROM api_log WHERE 1=1`;
+    const params = [];
+    if (ipFilt) { params.push(ipFilt);  q += ` AND ip = $${params.length}`; }
+    if (pfFilt) { params.push(pfFilt);  q += ` AND path = $${params.length}`; }
+    q += ` ORDER BY ts DESC LIMIT $${params.length + 1}`;
+    params.push(limit);
+
+    const result = await pool.query(q, params);
+    res.json({ count: result.rowCount, rows: result.rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ── GET /api/admin/stats ────────────────────────────────────────── *
+ * Summary stats for the last 24h — top IPs and paths by hit count.
+ * ─────────────────────────────────────────────────────────────────── */
+app.get('/api/admin/stats', async (req, res) => {
+  const provided = req.headers['x-admin-key'] || req.query.key || '';
+  if (!process.env.ADMIN_KEY || provided !== process.env.ADMIN_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  try {
+    const [topIps, topPaths, recentErrors] = await Promise.all([
+      pool.query(`SELECT ip, COUNT(*) AS hits FROM api_log
+                  WHERE ts > NOW() - INTERVAL '24 hours'
+                  GROUP BY ip ORDER BY hits DESC LIMIT 20`),
+      pool.query(`SELECT path, method, COUNT(*) AS hits FROM api_log
+                  WHERE ts > NOW() - INTERVAL '24 hours'
+                  GROUP BY path, method ORDER BY hits DESC LIMIT 20`),
+      pool.query(`SELECT ts, ip, method, path, status, ua FROM api_log
+                  WHERE ts > NOW() - INTERVAL '24 hours' AND status >= 400
+                  ORDER BY ts DESC LIMIT 50`),
+    ]);
+    res.json({
+      top_ips:      topIps.rows,
+      top_paths:    topPaths.rows,
+      recent_errors: recentErrors.rows,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
