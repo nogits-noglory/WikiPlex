@@ -220,15 +220,19 @@ let W = () => window.innerWidth;
 let H = () => window.innerHeight;
 let graphPanelOpen = false;
 
-const zoomRoot = svg.append('g').attr('class','zoom-root');
-const edgeVisG = zoomRoot.append('g').attr('class','edges-v');
-const edgeHitG = zoomRoot.append('g').attr('class','edges-h');
-const nodeG    = zoomRoot.append('g').attr('class','nodes');
+const zoomRoot        = svg.append('g').attr('class','zoom-root');
+const edgeVisG        = zoomRoot.append('g').attr('class','edges-v');
+const edgeHitG        = zoomRoot.append('g').attr('class','edges-h');
+const spotlightLinkG  = zoomRoot.append('g').attr('class','spotlight-links');
+const spotlightNodesG = zoomRoot.append('g').attr('class','spotlight-nodes');
+const nodeG           = zoomRoot.append('g').attr('class','nodes');
 
 let simulation, sseSource;
 let gNodes = [], gLinks = [];
 let rawNodes = {};
-let selectedNodeId = null;
+let selectedNodeId  = null;
+let _spotlightNodeId = null;
+let _spotlightNodes  = [];
 const queuedTitles = new Set(); // titles queued this session — persists across panel open/close
 
 /* ── Path Finder state ── */
@@ -828,6 +832,7 @@ function renderGraph() {
       .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
     nodeG.selectAll('g.node')
       .attr('transform', d => `translate(${d.x ?? 0},${d.y ?? 0})`);
+    _tickSpotlight();
   });
 
   simulation.alpha(0.7).restart();
@@ -884,8 +889,94 @@ function _neighborSet(id) {
   return nbrs;
 }
 
-/* ── Spotlight: full dim of non-connected nodes + edge reveal ── */
-function applySpotlight(id) {
+/* ── Spotlight ghost ring: Wikipedia links rendered in a wide outer ring ── */
+function _tickSpotlight() {
+  if (!_spotlightNodeId || !_spotlightNodes.length) return;
+  const anchor = gNodes.find(n => n.id === _spotlightNodeId);
+  if (!anchor || anchor.x == null) return;
+  const R = 1600;
+  const n = _spotlightNodes.length;
+  spotlightLinkG.selectAll('line.sl')
+    .attr('x1', anchor.x).attr('y1', anchor.y)
+    .attr('x2', d => anchor.x + R * Math.cos(d.angle))
+    .attr('y2', d => anchor.y + R * Math.sin(d.angle));
+  spotlightNodesG.selectAll('g.sg')
+    .attr('transform', d => `translate(${anchor.x + R * Math.cos(d.angle)},${anchor.y + R * Math.sin(d.angle)})`);
+}
+
+function _renderSpotlightGhosts(nodeId, links) {
+  if (_spotlightNodeId !== nodeId) return; // spotlight changed while fetching
+  const anchor = gNodes.find(n => n.id === nodeId);
+  if (!anchor) return;
+
+  // Only show links not already present in the graph as any node type
+  const existing = new Set(gNodes.map(n => n.id));
+  const fresh = links.filter(t => !existing.has(t));
+  const MAX = 150;
+  const count = Math.min(fresh.length, MAX);
+  _spotlightNodes = fresh.slice(0, count).map((title, i) => ({
+    id: title, title,
+    angle: (2 * Math.PI * i) / count,
+  }));
+
+  // Lines from anchor to each link ghost
+  spotlightLinkG.selectAll('line.sl')
+    .data(_spotlightNodes, d => d.id)
+    .join(
+      enter => enter.append('line').attr('class','sl')
+        .attr('stroke', 'rgba(120,160,220,0.1)')
+        .attr('stroke-width', 0.5)
+        .attr('pointer-events', 'none'),
+      update => update,
+      exit   => exit.remove()
+    );
+
+  // Ghost dots + labels
+  spotlightNodesG.selectAll('g.sg')
+    .data(_spotlightNodes, d => d.id)
+    .join(
+      enter => {
+        const g = enter.append('g').attr('class', 'sg')
+          .attr('opacity', 0)
+          .call(s => s.transition().duration(500).attr('opacity', 1));
+        g.append('circle')
+          .attr('r', 3.5)
+          .attr('fill', '#0a1a2e')
+          .attr('stroke', 'rgba(120,170,240,0.45)')
+          .attr('stroke-width', 1);
+        g.append('text')
+          .attr('text-anchor', 'middle')
+          .attr('font-family', 'Share Tech Mono,monospace')
+          .attr('font-size', '8px')
+          .attr('fill', 'rgba(120,160,210,0.6)')
+          .attr('dy', 13)
+          .attr('pointer-events', 'none')
+          .text(d => truncLabel(d.title));
+        g.on('click', (event, d) => {
+          event.stopPropagation();
+          showArticleForTitle(d.title);
+        });
+        return g;
+      },
+      update => update,
+      exit => exit.transition().duration(200).attr('opacity', 0).remove()
+    );
+
+  _tickSpotlight(); // position immediately
+}
+
+function clearSpotlightGhosts() {
+  _spotlightNodeId = null;
+  _spotlightNodes  = [];
+  spotlightLinkG.selectAll('line.sl').remove();
+  spotlightNodesG.selectAll('g.sg')
+    .transition().duration(200).attr('opacity', 0).remove();
+}
+
+/* ── Spotlight: full dim of non-connected nodes + edge reveal + outer link ring ── */
+async function applySpotlight(id) {
+  _spotlightNodeId = id;
+
   const nbrs = _neighborSet(id);
   nodeG.selectAll('g.node').classed('selected', d => nbrs.has(d.id));
   edgeVisG.selectAll('line.ev')
@@ -900,12 +991,22 @@ function applySpotlight(id) {
       return s !== id && t !== id;
     });
   svg.classed('spotlight', true);
+
+  // Fetch Wikipedia links and render as a wider outer ghost ring
+  try {
+    const resp = await fetch(`/api/node/${encodeURIComponent(id)}/wikilinks`);
+    if (!resp.ok) return;
+    if (_spotlightNodeId !== id) return; // spotlight was cleared while fetching
+    const data = await resp.json();
+    _renderSpotlightGhosts(id, data.links || []);
+  } catch {}
 }
 
 function clearSpotlight() {
   svg.classed('spotlight', false);
   nodeG.selectAll('g.node').classed('selected', false).classed('nb-dim', false);
   edgeVisG.selectAll('line.ev').classed('faded', false).classed('connected', false).classed('hovered', false);
+  clearSpotlightGhosts();
 }
 
 function selectNode(id) {
@@ -926,7 +1027,6 @@ function deselect() {
 function highlightNeighbors(id, on) {
   if (on) {
     const nbrs = _neighborSet(id);
-    // Mark neighbors as selected (glow), dim everyone else
     nodeG.selectAll('g.node')
       .classed('selected', d => nbrs.has(d.id))
       .classed('nb-dim',   d => !nbrs.has(d.id));
@@ -936,7 +1036,6 @@ function highlightNeighbors(id, on) {
       return s !== id && t !== id;
     });
   } else {
-    // Mouse left: clear hover classes, restore spotlight if panel is open
     nodeG.selectAll('g.node').classed('nb-dim', false);
     if (selectedNodeId) {
       applySpotlight(selectedNodeId);

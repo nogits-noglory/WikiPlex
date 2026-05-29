@@ -345,6 +345,31 @@ app.get('/api/node/:title', async (req, res) => {
   }
 });
 
+/* ── GET /api/node/:title/wikilinks ─────────────────────────────── *
+ * Returns all Wikipedia-link targets for a classified node.
+ * Used by the spotlight ghost ring in the client.
+ * ─────────────────────────────────────────────────────────────────── */
+app.get('/api/node/:title/wikilinks', async (req, res) => {
+  const title = decodeURIComponent(req.params.title).trim();
+  if (!title || title.length > 300) {
+    return res.status(400).json({ error: 'Invalid title' });
+  }
+  try {
+    const r = await pool.query(
+      `SELECT to_node AS title
+       FROM edges
+       WHERE from_node = $1 AND edge_source = 'wikipedia_links'
+       ORDER BY to_node
+       LIMIT 300`,
+      [title]
+    );
+    res.json({ title, links: r.rows.map(row => row.title) });
+  } catch (err) {
+    console.error('/api/node wikilinks error:', err.message);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
 /* ── GET /api/search?q= ──────────────────────────────────────────── *
  * Case-insensitive full-text title search across classified nodes.
  * Falls back gracefully to an empty array on no match.
@@ -507,13 +532,17 @@ app.post('/api/classify', requireTrustedOrigin, rateLimit, async (req, res) => {
     // Spawn pipeline.py in the background — don't await, respond immediately
     classifyingNow.add(clean);
     const proc = spawn('python3', [PIPELINE_PATH, clean], {
-      env:   { ...process.env },
-      stdio: 'ignore',
-      detached: false,
+      env: { ...process.env },
     });
+    let classifyStderr = '';
+    proc.stderr.on('data', d => { classifyStderr += d.toString().slice(0, 2000); });
+    proc.stdout.on('data', () => {});
     proc.on('close', code => {
       classifyingNow.delete(clean);
-      if (code !== 0) console.error(`classify pipeline exit ${code} for "${clean}"`);
+      if (code !== 0) {
+        console.error(`classify pipeline exit ${code} for "${clean}"`);
+        if (classifyStderr) console.error('  stderr:', classifyStderr.slice(0, 500));
+      }
     });
     proc.on('error', err => {
       classifyingNow.delete(clean);

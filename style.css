@@ -110,6 +110,11 @@ body {
 .edge-hit { cursor: default; }
 .edge-hit.clickable   { cursor: pointer; }
 
+/* Spotlight link ghosts (Wikipedia outer ring) */
+.sg { cursor: pointer; }
+.sg text { pointer-events: none; }
+.sg:hover > circle { stroke: rgba(180,210,255,0.8) !important; }
+
 #hud {
   position: fixed;
   top: 0; left: 0; right: 0;
