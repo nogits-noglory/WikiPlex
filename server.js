@@ -107,7 +107,7 @@ app.get('/api/graph', async (req, res) => {
              geography, key_figures, linguistic_root,
              related_concepts, disambiguation_risks,
              nav_style_signal, gap_assessment,
-             visit_count, classified_at
+             thumbnail_url, visit_count, classified_at
       FROM nodes
       WHERE classified = true
     `;
@@ -449,6 +449,15 @@ app.post('/api/curriculum', rateLimit, async (req, res) => {
    ════════════════════════════════════════════════════════════════════ */
 
 const PIPELINE_PATH = process.env.PIPELINE_PATH || '/var/www/wikidactic/pipeline.py';
+
+/* Ensure thumbnail_url column exists on nodes table */
+(async () => {
+  try {
+    await pool.query(`ALTER TABLE nodes ADD COLUMN IF NOT EXISTS thumbnail_url TEXT`);
+  } catch (e) {
+    console.error('thumbnail_url migration error:', e.message);
+  }
+})();
 
 /* Create pathfind_sessions table on startup */
 (async () => {

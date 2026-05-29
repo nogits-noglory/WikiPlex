@@ -113,7 +113,8 @@ function edgeColor(e) {
 function isRichEdge(d) {
   return d._src === 'ai_inference' || d._src === 'embedding_similarity';
 }
-function nodeRadius(d) { return 6 + (d.depth_score || 3) * 1.8; }
+function nodeRadius(d) { return d.thumbnail_url ? 28 : 6 + (d.depth_score || 3) * 1.8; }
+function nodePatternId(id) { return 'nip-' + id.replace(/[^a-z0-9]/gi, '_').slice(0, 60); }
 
 function $(id) { return document.getElementById(id); }
 function esc(s) {
@@ -214,6 +215,7 @@ function setStep(s) {
    D3 GRAPH
 ────────────────────────────────────────────── */
 const svg = d3.select('#graph-svg');
+const svgDefs = svg.append('defs'); // image patterns live here
 let W = () => window.innerWidth;
 let H = () => window.innerHeight;
 let graphPanelOpen = false;
@@ -287,18 +289,20 @@ function nudgeGraph(panelOpen) {
   simulation.alpha(0.35).restart();
 }
 
+const GHOST_RING_R = () => Math.min(graphCenterX(), H() / 2) * 0.82;
+
 function makeSimulation() {
   return d3.forceSimulation()
     .force('link', d3.forceLink()
       .id(d => d.id)
       .distance(d => {
-        if (d._ghost_edge) return 340;             // ghost edges — long tether, keeps them in the outer ring
+        if (d._ghost_edge) return GHOST_RING_R() * 1.05; // tether length matches ring radius
         if (d._src === 'embedding_similarity') return 160;
         if (d._src === 'ai_inference')         return 120;
         return 260;
       })
       .strength(d => {
-        if (d._ghost_edge) return 0.04;            // weak pull — ghost nodes drift out, not snapped close
+        if (d._ghost_edge) return 0.006; // almost no pull — radial force owns position
         if (d._src === 'embedding_similarity') return 0.30;
         if (d._src === 'ai_inference')         return 0.55;
         return 0.08;
@@ -306,21 +310,21 @@ function makeSimulation() {
     )
     .force('charge', d3.forceManyBody()
       .strength(d => d.ghost
-        ? -180                                     // strong repulsion — ghosts push each other and classified nodes away
+        ? -22   // light repulsion — just enough to spread ghosts along the ring
         : -(320 + (d.depth_score || 3) * 32))
-      .distanceMax(700)
+      .distanceMax(d => d.ghost ? 120 : 600)
     )
     .force('collide', d3.forceCollide()
-      .radius(d => (d.ghost ? 10 : nodeRadius(d)) + 24)
+      .radius(d => (d.ghost ? 10 : nodeRadius(d)) + (d.ghost ? 14 : 24))
       .iterations(3)
     )
     .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.04))
-    // Ghost nodes pushed outward to a ring — classified nodes cluster in the middle
+    // Dominant radial force — ghosts orbit at GHOST_RING_R from center
     .force('ghost_radial', d3.forceRadial(
-      d => d.ghost ? Math.min(graphCenterX(), H()/2) * 0.75 : 0,
+      d => d.ghost ? GHOST_RING_R() : 0,
       graphCenterX(), H()/2
-    ).strength(d => d.ghost ? 0.35 : 0))
-    // Soft domain-clustering for classified nodes only
+    ).strength(d => d.ghost ? 0.80 : 0))
+    // Domain-clustering for classified nodes only
     .force('domain_x', d3.forceX(d => {
       if (d.ghost) return graphCenterX();
       const domainIndex = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
@@ -427,13 +431,40 @@ async function loadGraph() {
       y: p?.y ?? (cy + (Math.random()-.5)*180),
     };
   });
-  const ghostNodes = allGhostIds.map(id => {
-    const p = pos.get(id);
+  // Build a map of ghost → parent classified node (for ring-angle seeding)
+  const ghostParent = new Map();
+  frontierEdges.forEach(e => {
+    const gId = !nodeIds.has(e.from) ? e.from : e.to;
+    const pId = !nodeIds.has(e.from) ? e.to   : e.from;
+    if (!ghostParent.has(gId)) ghostParent.set(gId, pId);
+  });
+
+  const R = GHOST_RING_R();
+  const ghostNodes = allGhostIds.map((id, i) => {
+    const existing = pos.get(id);
+    if (existing) {
+      return {
+        id, title: id, ghost: true, primary_domain: 'other', depth_score: 1,
+        typed_ghost: typedGhostIds.has(id),
+        x: existing.x, y: existing.y,
+      };
+    }
+    // New ghost: seed it on the ring, angled toward its parent classified node
+    const parentId  = ghostParent.get(id);
+    const parentPos = parentId ? pos.get(parentId) : null;
+    const baseAngle = parentPos
+      ? Math.atan2(parentPos.y - cy, parentPos.x - cx)
+      : (i / allGhostIds.length) * 2 * Math.PI;
+    // Spread multiple ghosts from the same parent with a small fan offset
+    const siblings = allGhostIds.filter(g => ghostParent.get(g) === parentId);
+    const sibIdx   = siblings.indexOf(id);
+    const spread   = siblings.length > 1 ? (sibIdx / siblings.length - 0.5) * 0.9 : 0;
+    const angle    = baseAngle + spread;
     return {
       id, title: id, ghost: true, primary_domain: 'other', depth_score: 1,
       typed_ghost: typedGhostIds.has(id),
-      x: p?.x ?? (cx + (Math.random()-.5)*300),
-      y: p?.y ?? (cy + (Math.random()-.5)*300),
+      x: cx + Math.cos(angle) * R,
+      y: cy + Math.sin(angle) * R,
     };
   });
   gNodes = [...classifiedNodes, ...ghostNodes];
@@ -454,6 +485,28 @@ async function loadGraph() {
 /* ── Render / update graph ── */
 function renderGraph() {
   if (!simulation) simulation = makeSimulation();
+
+  /* ── SVG image patterns for thumbnail nodes ── */
+  svgDefs.selectAll('pattern.nip')
+    .data(gNodes.filter(n => !n.ghost && n.thumbnail_url), d => d.id)
+    .join(
+      enter => {
+        const pat = enter.append('pattern')
+          .attr('class', 'nip')
+          .attr('id', d => nodePatternId(d.id))
+          .attr('patternUnits', 'objectBoundingBox')
+          .attr('width', 1).attr('height', 1);
+        pat.append('image')
+          .attr('href', d => d.thumbnail_url)
+          .attr('x', 0).attr('y', 0)
+          .attr('width', d => nodeRadius(d) * 2)
+          .attr('height', d => nodeRadius(d) * 2)
+          .attr('preserveAspectRatio', 'xMidYMid slice');
+        return pat;
+      },
+      update => update,
+      exit => exit.remove()
+    );
 
   const tooltip = $('edge-tooltip');
 
@@ -607,15 +660,30 @@ function renderGraph() {
 
     const r = nodeRadius(d);
     const ps = getPS(d.id);
+    const hasImg = !!d.thumbnail_url;
+    const domCol = domainColor(d.primary_domain);
 
     g.select('.node-conquest-ring').attr('r', r + 12);
-    g.select('.node-ring').attr('r', r + 6);
-    g.select('.node-glow').attr('r', r + 8);
-    g.select('.node-main').attr('r', r)
-      .attr('fill', domainColor(d.primary_domain))
-      .attr('opacity', ps === PS.UNTOUCHED ? 0.82 : 1);
-    g.select('.node-glow').attr('fill', domainColor(d.primary_domain))
+    g.select('.node-ring').attr('r', r + 6)
+      .attr('stroke', domCol);
+    g.select('.node-glow').attr('r', r + 8)
+      .attr('fill', domCol)
       .attr('opacity', ps === PS.UNTOUCHED ? 0.18 : 0.38);
+
+    if (hasImg) {
+      // Circular image: pattern fill + domain-color border ring
+      g.select('.node-main').attr('r', r)
+        .attr('fill', `url(#${nodePatternId(d.id)})`)
+        .attr('opacity', 1)
+        .attr('stroke', domCol)
+        .attr('stroke-width', 2.5);
+    } else {
+      g.select('.node-main').attr('r', r)
+        .attr('fill', domCol)
+        .attr('opacity', ps === PS.UNTOUCHED ? 0.82 : 1)
+        .attr('stroke', 'none');
+    }
+
     g.select('.node-label')
       .attr('dy', r + 15)
       .attr('fill', ps === PS.UNTOUCHED ? '#3a5a7a' : '#0d2030')

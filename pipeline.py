@@ -110,10 +110,10 @@ def db_write_node(conn, node: dict):
             primary_domain, domains, era, primary_geography,
             geography, key_figures, linguistic_root,
             related_concepts, disambiguation_risks,
-            nav_style_signal, gap_assessment, classified_at, visit_count
+            nav_style_signal, gap_assessment, thumbnail_url, classified_at, visit_count
         ) VALUES (
             %s,%s,%s,%s, %s,%s,%s, %s,%s, %s,%s,%s,%s,
-            %s,%s,%s, %s,%s, %s,%s,%s, 1
+            %s,%s,%s, %s,%s, %s,%s,%s,%s, 1
         )
         ON CONFLICT (id) DO UPDATE SET
             title               = EXCLUDED.title,
@@ -135,6 +135,7 @@ def db_write_node(conn, node: dict):
             disambiguation_risks= EXCLUDED.disambiguation_risks,
             nav_style_signal    = EXCLUDED.nav_style_signal,
             gap_assessment      = EXCLUDED.gap_assessment,
+            thumbnail_url       = COALESCE(EXCLUDED.thumbnail_url, nodes.thumbnail_url),
             classified_at       = EXCLUDED.classified_at,
             visit_count         = nodes.visit_count + 1
     """, (
@@ -150,6 +151,7 @@ def db_write_node(conn, node: dict):
         PgJson(node["related_concepts"]) if node.get("related_concepts") else None,
         PgJson(node["disambiguation_risks"]) if node.get("disambiguation_risks") else None,
         node.get("nav_style_signal"), node.get("gap_assessment"),
+        node.get("thumbnail_url"),
         node.get("visited_at"),
     ))
     cur.execute("DELETE FROM frontier WHERE id = %s", (node["id"],))
@@ -332,8 +334,9 @@ def fetch_wikipedia(title: str) -> dict:
     base = "https://en.wikipedia.org/w/api.php"
     params_text = {
         "action": "query", "titles": title,
-        "prop": "extracts", "exintro": False,
+        "prop": "extracts|pageimages", "exintro": False,
         "explaintext": True, "redirects": 1,
+        "pithumbsize": 300, "piprop": "thumbnail",
         "format": "json", "origin": "*"
     }
     params_links = {
@@ -367,11 +370,14 @@ def fetch_wikipedia(title: str) -> dict:
     outbound_links = [l["title"] for l in links_pages[0].get("links", [])]
     word_count = len(article_text.split())
 
+    thumbnail_url = page.get("thumbnail", {}).get("source") or None
+
     return {
         "title":          page["title"],
         "text":           truncated,
         "outbound_links": outbound_links,
         "word_count":     word_count,
+        "thumbnail_url":  thumbnail_url,
     }
 
 # --- Preclassifier ---
@@ -634,7 +640,7 @@ def parse_response(raw: str) -> dict:
     return parsed
 
 # --- Graph updates ---
-def extract_graph_updates(title: str, parsed: dict, outbound_links: list) -> tuple:
+def extract_graph_updates(title: str, parsed: dict, outbound_links: list, thumbnail_url: str = None) -> tuple:
     c = parsed["classification"]
     triples = parsed["triples"]
     now = datetime.now(timezone.utc).isoformat()
@@ -660,6 +666,7 @@ def extract_graph_updates(title: str, parsed: dict, outbound_links: list) -> tup
         "disambiguation_risks":c.get("disambiguation_risks"),
         "nav_style_signal":    c.get("nav_style_signal"),
         "gap_assessment":      c.get("gap_assessment"),
+        "thumbnail_url":       thumbnail_url,
         "visited_at":          now,
     }
 
@@ -988,6 +995,41 @@ SEED_ARTICLES = [
     "Colonialism",
 ]
 
+def backfill_images():
+    """Fetch thumbnail_url for all classified nodes that currently have none."""
+    conn = get_db_conn()
+    if not conn:
+        err("No DB connection for backfill-images")
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM nodes WHERE classified = true AND (thumbnail_url IS NULL OR thumbnail_url = '')")
+        rows = cur.fetchall()
+        cur.close()
+        log(f"Backfilling images for {len(rows)} nodes...", GOLD)
+        updated = 0
+        for (node_id,) in rows:
+            try:
+                wiki = fetch_wikipedia(node_id)
+                url = wiki.get("thumbnail_url")
+                if url:
+                    c2 = conn.cursor()
+                    c2.execute("UPDATE nodes SET thumbnail_url = %s WHERE id = %s", (url, node_id))
+                    c2.close()
+                    conn.commit()
+                    ok(f"  {node_id}: {url[:60]}...")
+                    updated += 1
+                else:
+                    dim(f"  {node_id}: no thumbnail found")
+            except Exception as e:
+                warn(f"  {node_id}: {e}")
+        log(f"Updated {updated}/{len(rows)} nodes with thumbnails.", GOLD)
+    except Exception as e:
+        err(f"backfill-images failed: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
 def seed_frontier():
     """Add canonical high-quality articles to the frontier queue."""
     conn = get_db_conn()
@@ -1105,7 +1147,7 @@ def run(input_title: str):
 
     # Step 6: Extract graph updates
     node, frontier_updates, all_edges = extract_graph_updates(
-        wiki["title"], parsed, wiki["outbound_links"]
+        wiki["title"], parsed, wiki["outbound_links"], wiki.get("thumbnail_url")
     )
 
     inferred_edges   = [e for e in all_edges if e["source"] == "ai_inference"]
@@ -1357,6 +1399,10 @@ if __name__ == "__main__":
         # Re-run cross-edge inference for all classified nodes
         repair_cross_edges()
 
+    elif "--backfill-images" in args:
+        # Fetch and store thumbnail_url for all classified nodes that lack one
+        backfill_images()
+
     elif "--reseed" in args:
         # Add canonical high-quality articles to the frontier
         log("Seeding frontier with canonical articles...", GOLD)
@@ -1378,6 +1424,7 @@ if __name__ == "__main__":
         dim("python pipeline.py --worker --batch=10    drain 10 items at a time")
         dim("python pipeline.py --reseed               add 30 canonical articles to the frontier")
         dim("python pipeline.py --repair-cross         re-run cross-edge inference for all nodes")
+        dim("python pipeline.py --backfill-images      fetch thumbnails for nodes that have none")
         print()
         title = input(f"{GOLD}  Article title (or press Enter for random): {RESET}").strip()
         if not title:
