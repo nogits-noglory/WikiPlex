@@ -481,6 +481,9 @@ app.post('/api/generate', requireTrustedOrigin, rateLimit, async (req, res) => {
 /* ── POST /api/classify ──────────────────────────────────────────── *
  * Queues a Wikipedia article for classification into the graph.
  * ─────────────────────────────────────────────────────────────────── */
+/* In-progress classification titles: prevents duplicate pipeline spawns */
+const classifyingNow = new Set();
+
 app.post('/api/classify', requireTrustedOrigin, rateLimit, async (req, res) => {
   const { title } = req.body;
   if (!title || typeof title !== 'string' || title.trim().length < 1) {
@@ -488,34 +491,39 @@ app.post('/api/classify', requireTrustedOrigin, rateLimit, async (req, res) => {
   }
   const clean = title.trim().slice(0, 300);
   try {
-    // Already fully classified — no point re-queuing
+    // Already classified
     const nodeCheck = await pool.query(
-      'SELECT id FROM nodes WHERE id = $1 AND classified = true',
-      [clean]
+      'SELECT id FROM nodes WHERE id = $1 AND classified = true', [clean]
     );
     if (nodeCheck.rowCount > 0) {
       return res.status(200).json({ status: 'already_classified', title: clean });
     }
 
-    // Already sitting in the queue
-    const frontierCheck = await pool.query(
-      'SELECT id FROM frontier WHERE id = $1',
-      [clean]
-    );
-    if (frontierCheck.rowCount > 0) {
-      return res.status(200).json({ status: 'already_queued', title: clean });
+    // Pipeline already running for this title
+    if (classifyingNow.has(clean)) {
+      return res.status(202).json({ status: 'classifying', title: clean });
     }
 
-    await pool.query(
-      `INSERT INTO frontier (id, title, added_at)
-       VALUES ($1, $2, NOW())
-       ON CONFLICT (id) DO NOTHING`,
-      [clean, clean]
-    );
-    return res.status(202).json({ status: 'queued', title: clean });
+    // Spawn pipeline.py in the background — don't await, respond immediately
+    classifyingNow.add(clean);
+    const proc = spawn('python3', [PIPELINE_PATH, clean], {
+      env:   { ...process.env },
+      stdio: 'ignore',
+      detached: false,
+    });
+    proc.on('close', code => {
+      classifyingNow.delete(clean);
+      if (code !== 0) console.error(`classify pipeline exit ${code} for "${clean}"`);
+    });
+    proc.on('error', err => {
+      classifyingNow.delete(clean);
+      console.error(`classify spawn error for "${clean}":`, err.message);
+    });
+
+    return res.status(202).json({ status: 'classifying', title: clean });
   } catch (err) {
     console.error('/api/classify error:', err.message);
-    return res.status(500).json({ error: 'Could not queue article' });
+    return res.status(500).json({ error: 'Could not start classification' });
   }
 });
 

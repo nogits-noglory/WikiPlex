@@ -1775,14 +1775,14 @@ async function showArticleForTitle(title) {
           if (data.status === 'already_classified') {
             graphBtn.textContent = 'Already on map';
             showToast(`${wiki.title} is already on the map`);
-          } else if (data.status === 'already_queued') {
-            queuedTitles.add(wiki.title);
-            graphBtn.textContent = 'Queued for map';
-            showToast(`${wiki.title} is already queued — check back soon`);
+          } else if (data.status === 'classifying' || data.status === 'already_queued') {
+            graphBtn.textContent = 'Classifying…';
+            graphBtn.disabled = true;
+            showToast(`Classifying ${wiki.title} — it will appear on the map when done`);
           } else {
-            queuedTitles.add(wiki.title);
-            graphBtn.textContent = 'Queued for map';
-            showToast(`${wiki.title} queued — it will appear on the map shortly`);
+            graphBtn.textContent = 'Classifying…';
+            graphBtn.disabled = true;
+            showToast(`Classifying ${wiki.title} — watch the map`);
           }
         } else {
           graphBtn.disabled = false;
