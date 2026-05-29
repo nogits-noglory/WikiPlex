@@ -113,7 +113,7 @@ function edgeColor(e) {
 function isRichEdge(d) {
   return d._src === 'ai_inference' || d._src === 'embedding_similarity';
 }
-function nodeRadius(d) { return d.thumbnail_url ? 40 : 10 + (d.depth_score || 3) * 2.5; }
+function nodeRadius(d) { return d.thumbnail_url ? 52 : 12 + (d.depth_score || 3) * 2.8; }
 function nodePatternId(id) { return 'nip-' + id.replace(/[^a-z0-9]/gi, '_').slice(0, 60); }
 
 function $(id) { return document.getElementById(id); }
@@ -293,8 +293,12 @@ function nudgeGraph(panelOpen) {
 // There are NO viewport-relative constraints — the graph is truly unlimited.
 const WORLD_CX = 2000;   // world center x
 const WORLD_CY = 2000;   // world center y
-const GHOST_RING_R = () => 2600;   // ghost ring radius from world center
-const CLUSTER_R    = () => 1400;   // classified nodes spread to this radius
+// Both radii scale with classified node count so nodes never crowd each other.
+// At 10 nodes: CLUSTER_R~950, GHOST_RING_R~2350
+// At 30 nodes: CLUSTER_R~1540, GHOST_RING_R~2940
+// At 60 nodes: CLUSTER_R~2170, GHOST_RING_R~3570
+const CLUSTER_R    = () => Math.max(900, Math.sqrt(gNodes.filter(n => !n.ghost).length) * 280);
+const GHOST_RING_R = () => CLUSTER_R() + 1400;
 
 function makeSimulation() {
   return d3.forceSimulation()
@@ -302,26 +306,26 @@ function makeSimulation() {
       .id(d => d.id)
       .distance(d => {
         if (d._ghost_edge)                     return GHOST_RING_R() * 1.05;
-        if (d._src === 'embedding_similarity') return 580;
-        if (d._src === 'ai_inference')         return 480;
-        return 750; // structural fallback edges between classified nodes
+        if (d._src === 'embedding_similarity') return 750;
+        if (d._src === 'ai_inference')         return 650;
+        return 900; // structural fallback edges between classified nodes
       })
       .strength(d => {
-        if (d._ghost_edge)                     return 0.003;
-        if (d._src === 'embedding_similarity') return 0.18;
-        if (d._src === 'ai_inference')         return 0.35;
-        return 0.03;
+        if (d._ghost_edge)                     return 0.002;
+        if (d._src === 'embedding_similarity') return 0.12;
+        if (d._src === 'ai_inference')         return 0.25;
+        return 0.02;
       })
     )
     .force('charge', d3.forceManyBody()
       .strength(d => d.ghost
-        ? -50
-        : -(2200 + (d.depth_score || 3) * 120))
-      .distanceMax(d => d.ghost ? 300 : 6000)
+        ? -80
+        : -(4500 + (d.depth_score || 3) * 200))
+      .distanceMax(d => d.ghost ? 500 : 8000)
     )
     .force('collide', d3.forceCollide()
-      .radius(d => (d.ghost ? 10 : nodeRadius(d)) + (d.ghost ? 20 : 50))
-      .iterations(3)
+      .radius(d => (d.ghost ? 12 : nodeRadius(d)) + (d.ghost ? 30 : 90))
+      .iterations(4)
     )
     // Minimal center gravity — just prevents infinite drift
     .force('center', d3.forceCenter(WORLD_CX, WORLD_CY).strength(0.003))
@@ -331,13 +335,13 @@ function makeSimulation() {
       const idx   = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
       const total = Object.keys(DOMAIN_COLOR).length;
       return WORLD_CX + Math.cos((idx / total) * 2 * Math.PI) * CLUSTER_R();
-    }).strength(d => d.ghost ? 0 : 0.045))
+    }).strength(d => d.ghost ? 0 : 0.028))
     .force('domain_y', d3.forceY(d => {
       if (d.ghost) return WORLD_CY;
       const idx   = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
       const total = Object.keys(DOMAIN_COLOR).length;
       return WORLD_CY + Math.sin((idx / total) * 2 * Math.PI) * CLUSTER_R();
-    }).strength(d => d.ghost ? 0 : 0.045))
+    }).strength(d => d.ghost ? 0 : 0.028))
     // Ghost nodes locked to outer ring in world space
     .force('ghost_radial', d3.forceRadial(
       d => d.ghost ? GHOST_RING_R() : 0,
