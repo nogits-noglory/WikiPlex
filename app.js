@@ -268,13 +268,7 @@ svg.on('click', e => {
 });
 
 window.addEventListener('resize', () => {
-  if (simulation) {
-    const cx = graphCenterX(), cy = H()/2;
-    simulation.force('center', d3.forceCenter(cx, cy).strength(0.008));
-    const radial = simulation.force('ghost_radial');
-    if (radial) radial.x(cx).y(cy);
-    simulation.alpha(0.3).restart();
-  }
+  if (simulation) requestAnimationFrame(() => fitGraph(0));
 });
 
 function graphCenterX() {
@@ -286,15 +280,18 @@ function graphCenterX() {
 
 function nudgeGraph(panelOpen) {
   graphPanelOpen = panelOpen;
-  if (!simulation) return;
-  simulation.force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.06));
-  simulation.alpha(0.35).restart();
+  // Simulation lives in world space — just refit the (now narrower/wider) viewport
+  requestAnimationFrame(() => fitGraph(300));
 }
 
-// Ring radius: 88% of the smaller viewport half — leaves a thin margin
-const GHOST_RING_R = () => Math.min(graphCenterX(), H() / 2) * 0.88;
-// Classified nodes spread across 55% of the smaller half
-const CLUSTER_R    = () => Math.min(graphCenterX(), H() / 2) * 0.55;
+// ── World-space simulation constants ───────────────────────────────────────
+// The simulation runs in its own large coordinate system (world space).
+// fitGraph() always scales+pans the SVG to show the current bounding box.
+// There are NO viewport-relative constraints — the graph is truly unlimited.
+const WORLD_CX = 2000;   // world center x
+const WORLD_CY = 2000;   // world center y
+const GHOST_RING_R = () => 1600;   // ghost ring 1600px from world center
+const CLUSTER_R    = () => 950;    // classified nodes spread to 950px radius
 
 function makeSimulation() {
   return d3.forceSimulation()
@@ -302,46 +299,46 @@ function makeSimulation() {
       .id(d => d.id)
       .distance(d => {
         if (d._ghost_edge)                     return GHOST_RING_R() * 1.1;
-        if (d._src === 'embedding_similarity') return 220;
-        if (d._src === 'ai_inference')         return 180;
-        return 300; // structural fallback edges between classified nodes
+        if (d._src === 'embedding_similarity') return 380;
+        if (d._src === 'ai_inference')         return 310;
+        return 520; // structural fallback edges between classified nodes
       })
       .strength(d => {
         if (d._ghost_edge)                     return 0.004;
         if (d._src === 'embedding_similarity') return 0.20;
         if (d._src === 'ai_inference')         return 0.40;
-        return 0.05;
+        return 0.04;
       })
     )
     .force('charge', d3.forceManyBody()
       .strength(d => d.ghost
-        ? -10
-        : -(500 + (d.depth_score || 3) * 50))  // stronger repulsion — fills the viewport
-      .distanceMax(d => d.ghost ? 80 : 1400)    // classified nodes repel across the whole canvas
+        ? -30
+        : -(1400 + (d.depth_score || 3) * 90))
+      .distanceMax(d => d.ghost ? 200 : 4000)
     )
     .force('collide', d3.forceCollide()
-      .radius(d => (d.ghost ? 8 : nodeRadius(d)) + (d.ghost ? 10 : 28))
+      .radius(d => (d.ghost ? 8 : nodeRadius(d)) + (d.ghost ? 14 : 36))
       .iterations(3)
     )
-    // Very weak center gravity — just stops nodes flying off-screen
-    .force('center', d3.forceCenter(graphCenterX(), H()/2).strength(0.008))
-    // Classified nodes spread to CLUSTER_R by domain angle
+    // Minimal center gravity — just prevents infinite drift in an empty graph
+    .force('center', d3.forceCenter(WORLD_CX, WORLD_CY).strength(0.004))
+    // Classified nodes spread by domain angle in world space
     .force('domain_x', d3.forceX(d => {
-      if (d.ghost) return graphCenterX();
+      if (d.ghost) return WORLD_CX;
       const idx   = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
       const total = Object.keys(DOMAIN_COLOR).length;
-      return graphCenterX() + Math.cos((idx / total) * 2 * Math.PI) * CLUSTER_R();
-    }).strength(d => d.ghost ? 0 : 0.06))
+      return WORLD_CX + Math.cos((idx / total) * 2 * Math.PI) * CLUSTER_R();
+    }).strength(d => d.ghost ? 0 : 0.05))
     .force('domain_y', d3.forceY(d => {
-      if (d.ghost) return H() / 2;
+      if (d.ghost) return WORLD_CY;
       const idx   = Object.keys(DOMAIN_COLOR).indexOf(d.primary_domain || 'other');
       const total = Object.keys(DOMAIN_COLOR).length;
-      return H() / 2 + Math.sin((idx / total) * 2 * Math.PI) * CLUSTER_R();
-    }).strength(d => d.ghost ? 0 : 0.06))
-    // Ghost nodes locked to outer ring
+      return WORLD_CY + Math.sin((idx / total) * 2 * Math.PI) * CLUSTER_R();
+    }).strength(d => d.ghost ? 0 : 0.05))
+    // Ghost nodes locked to outer ring in world space
     .force('ghost_radial', d3.forceRadial(
       d => d.ghost ? GHOST_RING_R() : 0,
-      graphCenterX(), H()/2
+      WORLD_CX, WORLD_CY
     ).strength(d => d.ghost ? 0.92 : 0))
     .alphaDecay(0.015);
 }
@@ -486,15 +483,15 @@ async function loadGraph() {
 
   const visEdges = [...richClassifiedEdges, ...frontierEdges];
 
-  // Preserve positions from previous render; seed new nodes near center
-  const cx = graphCenterX(), cy = H()/2;
+  // Preserve positions from previous render; seed new nodes at world center
+  const cx = WORLD_CX, cy = WORLD_CY;
   const pos = new Map(gNodes.map(n => [n.id, {x:n.x, y:n.y}]));
   const classifiedNodes = Object.values(rawNodes).map(n => {
     const p = pos.get(n.id);
     return {
       ...n,
-      x: p?.x ?? (cx + (Math.random()-.5)*180),
-      y: p?.y ?? (cy + (Math.random()-.5)*180),
+      x: p?.x ?? (cx + (Math.random()-.5)*300),
+      y: p?.y ?? (cy + (Math.random()-.5)*300),
     };
   });
   // Build a map of ghost → parent classified node (for ring-angle seeding)
@@ -551,9 +548,9 @@ async function loadGraph() {
 /* ── Render / update graph ── */
 function renderGraph() {
   if (!simulation) simulation = makeSimulation();
-  // Re-center the ghost ring when the panel state changes viewport width
+  // Ghost ring lives in world space — center is always fixed
   const radial = simulation.force('ghost_radial');
-  if (radial) radial.x(graphCenterX()).y(H()/2);
+  if (radial) radial.x(WORLD_CX).y(WORLD_CY);
 
   /* ── SVG image patterns for thumbnail nodes ── */
   svgDefs.selectAll('pattern.nip')
@@ -862,7 +859,7 @@ function fitGraph(dur=600) {
   const pad = 80;
   const scaleX = (vw-2*pad) / (maxX-minX||1);
   const scaleY = (vh-2*pad) / (maxY-minY||1);
-  const scale = Math.min(scaleX, scaleY, 2);
+  const scale = Math.min(scaleX, scaleY, 1.0); // cap at 1.0 so world-space fits on screen
   const tx = (vw/2) - scale*(minX+maxX)/2;
   const ty = vh/2 - scale*(minY+maxY)/2;
   svg.transition().duration(dur)
