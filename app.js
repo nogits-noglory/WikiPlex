@@ -256,7 +256,10 @@ svg.call(zoomBehavior);
 svg.on('dblclick.zoom', null);
 svg.on('dblclick', e => {
   if (!e.target.closest('.node')) {
-    fitGraph(600);
+    // First dblclick: fit all nodes including ghost ring.
+    // Second dblclick (already zoomed out): fit classified cluster only.
+    const cur = d3.zoomTransform(svg.node()).k;
+    fitGraph(600, cur < 0.25);
   }
 });
 
@@ -542,7 +545,9 @@ async function loadGraph() {
 
   renderGraph();
   updateStats(data.meta);
-  requestAnimationFrame(() => { if (!graphPanelOpen) fitGraph(500); });
+  // On load: fit the classified cluster at comfortable reading size.
+  // Ghost ring is discoverable by zooming out (double-click fits everything).
+  requestAnimationFrame(() => { if (!graphPanelOpen) fitGraph(700, true); });
 }
 
 /* ── Render / update graph ── */
@@ -846,20 +851,30 @@ function highlightNeighbors(id, on) {
 }
 
 /* ── Camera ── */
-function fitGraph(dur=600) {
-  if (!gNodes.length) return;
-  const xs = gNodes.map(n=>n.x).filter(Boolean);
-  const ys = gNodes.map(n=>n.y).filter(Boolean);
+// fitGraph: zoom to fit a set of nodes; defaults to ALL nodes.
+// Pass classified=true to fit only the classified cluster (ignores ghost ring).
+function fitGraph(dur=600, classifiedOnly=false) {
+  const pool = classifiedOnly
+    ? gNodes.filter(n => !n.ghost)
+    : gNodes;
+  if (!pool.length && !gNodes.length) return;
+  const src = pool.length ? pool : gNodes;
+  const xs = src.map(n=>n.x).filter(v => v != null && isFinite(v));
+  const ys = src.map(n=>n.y).filter(v => v != null && isFinite(v));
   if (!xs.length) return;
   const minX=Math.min(...xs), maxX=Math.max(...xs);
   const minY=Math.min(...ys), maxY=Math.max(...ys);
   const pw = graphPanelOpen && window.innerWidth > 768
     ? parseInt(getComputedStyle(document.documentElement).getPropertyValue('--panel-w') || '440') : 0;
   const vw = W() - pw, vh = H();
-  const pad = 80;
+  const pad = classifiedOnly ? 120 : 60;
   const scaleX = (vw-2*pad) / (maxX-minX||1);
   const scaleY = (vh-2*pad) / (maxY-minY||1);
-  const scale = Math.min(scaleX, scaleY, 1.0); // cap at 1.0 so world-space fits on screen
+  // Classified-only view: cap at 0.8 (comfortable reading scale in world space)
+  // Full view: uncapped — user can see the whole graph
+  const scale = classifiedOnly
+    ? Math.min(scaleX, scaleY, 0.8)
+    : Math.min(scaleX, scaleY);
   const tx = (vw/2) - scale*(minX+maxX)/2;
   const ty = vh/2 - scale*(minY+maxY)/2;
   svg.transition().duration(dur)
@@ -897,7 +912,7 @@ function updateStats(meta) {
 function addNodeLive(node) {
   if (rawNodes[node.id]) return;
   rawNodes[node.id] = node;
-  const pos = { x: graphCenterX() + (Math.random()-.5)*200, y: H()/2 + (Math.random()-.5)*200 };
+  const pos = { x: WORLD_CX + (Math.random()-.5)*300, y: WORLD_CY + (Math.random()-.5)*300 };
   gNodes.push({ ...node, ...pos });
   renderGraph();
   showToast(`+ ${node.title}`);
