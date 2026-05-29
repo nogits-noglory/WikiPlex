@@ -206,8 +206,12 @@ app.get('/api/graph/stream', (req, res) => {
     if (!closed) setTimeout(poll, 2000);
   };
 
-  // Start polling
-  poll();
+  // Start from current max event ID so this connection only receives
+  // events that occur AFTER the client connects — never replays history.
+  pool.query('SELECT COALESCE(MAX(id), 0) AS max_id FROM graph_events')
+    .then(r => { lastId = r.rows[0].max_id; })
+    .catch(() => {})
+    .finally(() => { if (!closed) poll(); });
 
   // Keep-alive ping every 20s
   const pingInterval = setInterval(() => {
