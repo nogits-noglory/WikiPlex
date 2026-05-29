@@ -1141,7 +1141,7 @@ def seed_frontier():
 
 
 # --- Main pipeline ---
-def run(input_title: str):
+def run(input_title: str, force: bool = False):
     print()
     log("+===========================================+", GOLD)
     log("|          WikiFold Pipeline v0.2          |", GOLD)
@@ -1150,9 +1150,9 @@ def run(input_title: str):
 
     graph = load_graph()
 
-    if graph["nodes"].get(input_title, {}).get("classified"):
+    if graph["nodes"].get(input_title, {}).get("classified") and not force:
         warn(f'"{input_title}" is already in the graph.')
-        dim("Delete the node from graph.json to reclassify.")
+        dim("Delete the node from graph.json to reclassify, or use --enrich to re-run with current prompt.")
         print_node(graph["nodes"][input_title])
         return
 
@@ -1497,7 +1497,7 @@ if __name__ == "__main__":
             sys.exit(1)
         for t in enrich_titles:
             log(f'Re-enriching: "{t}"', GOLD)
-            run(t)
+            run(t, force=True)
 
     elif "--reseed" in args:
         # Add canonical high-quality articles to the frontier
