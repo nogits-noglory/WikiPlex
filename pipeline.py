@@ -561,17 +561,22 @@ RULES FOR triples:
 - object_wiki_title should be the exact Wikipedia article title for the object entity. Set it for ANY entity that plausibly has a Wikipedia article -- you are NOT limited to the outbound links list above. The outbound links are a hint, not a ceiling.
 - object_is_link should be true whenever you set object_wiki_title. Set it false only for abstract concepts that have no Wikipedia article (e.g. "the idea of justice", "an unnamed ancestor").
 - Never emit a triple where subject and object are the same article.
-- AIM TO USE EVERY EDGE TYPE FAMILY. Push yourself to find temporal, implication, analogy, influence, and application edges, not just categorical and geographical ones.
+- Use every edge type family where the evidence is direct and specific. Do not invent connections to fill quotas.
 
 THINK LIKE A DOMAIN EXPERT -- for every article, consider:
 - RIVALS & CONTEMPORARIES: What competed with this? What else existed at the same time? (analogy: "is analogous to", temporal: "contemporaneous with")
 - CHARACTERS & KEY FIGURES: Who are the most iconic people/characters associated with this? (positional: "stars", "depicts")
-- REAL-WORLD IMPACT: What did this cause, inspire, or regulate? What laws, organizations, or movements resulted from this? (implication: "historically led to", influence: "gave rise to")
-- ADAPTATIONS & SPIN-OFFS: Was this adapted into films, games, books, sequels? (positional: "created", influence: "gave rise to")
+- REAL-WORLD IMPACT: What did this directly cause or create? (implication: "historically led to")
+- ADAPTATIONS & SPIN-OFFS: Was this directly adapted? (positional: "created", influence: "gave rise to")
 - CREATORS & PUBLISHERS: Who made it? Who funded it? Who distributed it? (interpersonal: "created", positional: "founded")
 - PLATFORM & MEDIUM: What platform, genre, or medium does this belong to? (categorical: "type of", "part of")
 - PREDECESSOR & SUCCESSOR: What came before and after? (temporal: "preceded by", "succeeded by")
 - CONTROVERSIES & MISCONCEPTIONS: What is this commonly confused with? What challenged it? (misconception, implication: "challenged by")
+
+INFLUENCE EDGE STRICT RULES -- influence edges are the most commonly abused. Apply all three tests before emitting one:
+1. EXPLICIT: The article text must explicitly name the influenced/influencing entity. If you are inferring the connection from general knowledge or thematic similarity, do not emit it.
+2. DIRECT: The influence must be a single documented step -- A directly influenced B. Do not chain: "A influenced storytelling which influenced B." If you need more than one hop to explain the connection, skip it.
+3. SPECIFIC: Ask yourself -- would this influence triple apply equally well to 20 or more other Wikipedia articles? If yes, it is too generic. Skip it. Good: "Street Fighter directly influenced Mortal Kombat's combo mechanic." Bad: "Ancient Greek drama influenced modern storytelling."
 
 Examples of the kind of rich connections to extract:
 - For a VIDEO GAME: the game's franchise predecessors, rival franchises (Street Fighter vs Mortal Kombat), iconic characters (Sub-Zero for MK), the rating board it helped create (ESRB), the studio that made it, film adaptations, the genre it defines.
