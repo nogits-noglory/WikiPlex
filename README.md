@@ -17,7 +17,7 @@ This repo is the local classification pipeline - the data engine that powers the
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# add your Anthropic API key to .env
+# add your LLM_API_KEY to .env
 ```
 
 ## Usage
