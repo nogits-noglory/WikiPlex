@@ -116,6 +116,22 @@ function isRichEdge(d) {
 function nodeRadius(d) { return d.thumbnail_url ? 52 : 12 + (d.depth_score || 3) * 2.8; }
 function nodePatternId(id) { return 'nip-' + id.replace(/[^a-z0-9]/gi, '_').slice(0, 60); }
 
+/* Curved link path. All edges bow consistently to one side so the graph reads
+ * as organic arcs instead of a hard straight-line starburst. Ghost-ring edges
+ * curve less (they are long radial spokes); typed edges curve a touch more. */
+function linkPath(d) {
+  const s = d.source, t = d.target;
+  if (!s || !t || s.x == null || t.x == null) return 'M0,0';
+  const x1 = s.x, y1 = s.y, x2 = t.x, y2 = t.y;
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.hypot(dx, dy) || 1;
+  const curv = d._ghost_edge ? 0.07 : 0.15;
+  // control point = midpoint pushed along the perpendicular
+  const cx = (x1 + x2) / 2 + (-dy / len) * len * curv;
+  const cy = (y1 + y2) / 2 + ( dx / len) * len * curv;
+  return `M${x1},${y1}Q${cx},${cy} ${x2},${y2}`;
+}
+
 function $(id) { return document.getElementById(id); }
 function esc(s) {
   return String(s ?? '')
@@ -154,23 +170,49 @@ function showPC(id) {
     .forEach(pc => $(pc).classList.toggle('hidden', pc !== id));
 }
 
+function isMobile() { return window.innerWidth <= 768; }
+
 function openPanel(mode) {
   panelMode = mode;
-  $('detail-panel').classList.add('open');
+  const panel = $('detail-panel');
+  panel.classList.add('open');
   $('btn-back-to-map')?.classList.remove('hidden');
-  // Push graph center left so nodes don't hide behind panel
-  if (window.innerWidth > 768) nudgeGraph(true);
+  // When opening a node, frame its spotlight circle (centered, accounting for
+  // the panel). The circle was just laid out by applySpotlight.
+  const anchor = _spotlightNodeId ? gNodes.find(n => n.id === _spotlightNodeId) : null;
+  const frameCircle = (mode === 'node' && anchor && _spotlightCircleR);
+  if (isMobile()) {
+    // On mobile the panel is a bottom sheet. For the relationship ('node') view
+    // we keep it SHORT (a "peek" sheet) so the spotlit graph stays visible above
+    // it -- the whole point of spotlight mode. Study/article views use the full
+    // sheet since the graph is not the focus there.
+    const peek = (mode === 'node');
+    panel.classList.toggle('peek', peek);
+    graphPanelOpen = peek;            // reserve bottom space only while peeking
+    requestAnimationFrame(() => {
+      if (frameCircle)            _frameSpotlight(anchor, _spotlightCircleR, 500);
+      else if (peek && selectedNodeId) focusNode(selectedNodeId, 0.62);
+      else                        fitGraph(300);
+    });
+  } else {
+    graphPanelOpen = true;
+    requestAnimationFrame(() => {
+      if (frameCircle) _frameSpotlight(anchor, _spotlightCircleR, 500);
+      else             fitGraph(300);
+    });
+  }
 }
 function closePanel() {
   // Don't let generic closePanel tear down path mode — use exitPathMode() for that
   if (panelMode === 'pathfind') return;
-  $('detail-panel').classList.remove('open');
+  $('detail-panel').classList.remove('open', 'peek');
   $('study-tabs').classList.add('hidden');
   $('btn-back-to-map')?.classList.add('hidden');
   showPC('pc-idle');
   panelMode = 'idle';
   deselect();
-  if (window.innerWidth > 768) nudgeGraph(false);
+  graphPanelOpen = false;
+  requestAnimationFrame(() => fitGraph(300, true));
   renderLibrary();
 }
 
@@ -225,6 +267,7 @@ const edgeVisG        = zoomRoot.append('g').attr('class','edges-v');
 const edgeHitG        = zoomRoot.append('g').attr('class','edges-h');
 const spotlightLinkG  = zoomRoot.append('g').attr('class','spotlight-links');
 const spotlightNodesG = zoomRoot.append('g').attr('class','spotlight-nodes');
+const spotlightEdgeLabelsG = zoomRoot.append('g').attr('class','spotlight-edge-labels');
 const nodeG           = zoomRoot.append('g').attr('class','nodes');
 
 let simulation, sseSource;
@@ -233,6 +276,9 @@ let rawNodes = {};
 let selectedNodeId  = null;
 let _spotlightNodeId = null;
 let _spotlightNodes  = [];
+let _spotlightPinned = [];   // node ids fx/fy-pinned into the spotlight circle
+let _spotlightEdges  = [];   // connected gLinks shown with predicate labels
+let _spotlightCircleR = 0;   // radius of the current spotlight circle (world units)
 const queuedTitles = new Set(); // titles queued this session — persists across panel open/close
 
 /* ── Path Finder state ── */
@@ -302,7 +348,9 @@ const WORLD_CY = 2000;   // world center y
 // At 30 nodes: CLUSTER_R~1540, GHOST_RING_R~2940
 // At 60 nodes: CLUSTER_R~2170, GHOST_RING_R~3570
 const CLUSTER_R    = () => Math.max(900, Math.sqrt(gNodes.filter(n => !n.ghost).length) * 280);
-const GHOST_RING_R = () => CLUSTER_R() + 1400;
+// Pull the frontier ring closer to the cluster so there is less dead space
+// between the core graph and its ghost halo (the old +1400 left a big empty gap).
+const GHOST_RING_R = () => CLUSTER_R() + 950;
 
 function makeSimulation() {
   return d3.forceSimulation()
@@ -328,8 +376,8 @@ function makeSimulation() {
       .distanceMax(d => d.ghost ? 500 : 8000)
     )
     .force('collide', d3.forceCollide()
-      .radius(d => (d.ghost ? 12 : nodeRadius(d)) + (d.ghost ? 30 : 90))
-      .iterations(4)
+      .radius(d => (d.ghost ? 12 : nodeRadius(d)) + (d.ghost ? 34 : 100))
+      .iterations(3)
     )
     // Minimal center gravity — just prevents infinite drift
     .force('center', d3.forceCenter(WORLD_CX, WORLD_CY).strength(0.003))
@@ -346,12 +394,19 @@ function makeSimulation() {
       const total = Object.keys(DOMAIN_COLOR).length;
       return WORLD_CY + Math.sin((idx / total) * 2 * Math.PI) * CLUSTER_R();
     }).strength(d => d.ghost ? 0 : 0.028))
-    // Ghost nodes locked to outer ring in world space
+    // Ghost nodes anchored to a per-node target radius. Each typed ghost gets
+    // its own ringR based on its parent's sibling index, which spreads ghosts
+    // RADIALLY into per-parent comet-tail spirals instead of cramming every
+    // ghost onto a single circle. Reduces angular collision dramatically.
     .force('ghost_radial', d3.forceRadial(
-      d => d.ghost ? GHOST_RING_R() : 0,
+      d => d.ghost ? (d.ringR ?? GHOST_RING_R()) : 0,
       WORLD_CX, WORLD_CY
     ).strength(d => d.ghost ? 0.92 : 0))
-    .alphaDecay(0.012);
+    // Settle a bit faster and stop sooner -- cuts the long tail of near-idle
+    // ticks that kept the CPU warm (and the page feeling laggy) after a load.
+    .alphaDecay(0.02)
+    .alphaMin(0.004)
+    .velocityDecay(0.42);
 }
 
 /* ── Load graph from API ── */
@@ -410,53 +465,50 @@ async function loadGraph() {
   //
   //  Total cap: ~55 ghost nodes → clean concentric ring.
 
-  // ── Typed ghost selection with domain-diversity cap ──────────────────────────
-  // Problem without this: if 14 football-stub nodes each have an edge to
-  // "Association football", it scores 14 and monopolizes the 40-slot budget.
-  // Fix: gather nomination info per ghost (unique source nodes + their domains),
-  // then limit each primary domain to MAX_PER_DOMAIN slots.
-  const MAX_TYPED_GHOSTS = 40;
-  const MAX_PER_DOMAIN   = 7;
+  // ── Typed ghost selection: PER-CLASSIFIED-NODE budget, edge-type round-robin ──
+  // Every classified node surfaces ITS OWN typed relationships as ghost nodes, so
+  // each node visibly branches into its real-world connections (rivals, studios,
+  // technologies, etc.) across all edge-type families. This is the future-proofed
+  // model: the budget is per source node, so it scales cleanly as the graph grows
+  // and no single popular target — nor a crowded domain — can starve a node of its
+  // own connections. (The old global 40-cap with a 7-per-domain limit lumped every
+  // same-domain node's distinct ghosts into one shared bucket, e.g. two technology
+  // nodes fighting over 7 slots, hiding most of each node's edges.)
+  const PER_NODE_GHOSTS = 10; // typed ghosts surfaced per classified node (lowered from 14 to cut SVG element count / pan-zoom lag while still surfacing each node's real relationships)
 
-  // rawNodes is keyed by id and carries primary_domain
-  const ghostNoms = new Map(); // ghostId -> { count, sources: Set<id>, domains: Set<domain> }
+  // Group each classified node's typed edges (to unclassified targets) by family.
+  const nodeTypedEdges = new Map(); // sourceId -> Map<edgeType, edge[]>
   allEdges.forEach(e => {
     if (!nodeIds.has(e.from) || nodeIds.has(e.to) || e.source === 'wikipedia_links') return;
-    if (!ghostNoms.has(e.to)) ghostNoms.set(e.to, { count: 0, sources: new Set(), domains: new Set() });
-    const n = ghostNoms.get(e.to);
-    n.count++;
-    n.sources.add(e.from);
-    n.domains.add(rawNodes[e.from]?.primary_domain || 'other');
+    if (!nodeTypedEdges.has(e.from)) nodeTypedEdges.set(e.from, new Map());
+    const byType = nodeTypedEdges.get(e.from);
+    const t = e.type || 'categorical';
+    if (!byType.has(t)) byType.set(t, []);
+    byType.get(t).push(e);
   });
 
-  // Sort by unique source-node count desc (raw count as tie-break)
-  const sortedGhostNoms = [...ghostNoms.entries()]
-    .sort((a, b) => b[1].sources.size - a[1].sources.size || b[1].count - a[1].count);
-
-  // Helper: pick most common domain among source nodes for a ghost
-  function primaryDomainFor(nom) {
-    const freq = new Map();
-    nom.domains.forEach(d => freq.set(d, (freq.get(d)||0) + 1));
-    return [...freq.entries()].sort((a,b) => b[1]-a[1])[0][0];
-  }
-
-  const domainUsed    = new Map();
   const typedGhostIds = new Set();
-
-  // First pass: domain-capped selection
-  for (const [ghostId, nom] of sortedGhostNoms) {
-    if (typedGhostIds.size >= MAX_TYPED_GHOSTS) break;
-    const dom  = primaryDomainFor(nom);
-    const used = domainUsed.get(dom) || 0;
-    if (used < MAX_PER_DOMAIN) {
-      typedGhostIds.add(ghostId);
-      domainUsed.set(dom, used + 1);
+  for (const [, byType] of nodeTypedEdges) {
+    // Highest-weight edge first within each family
+    byType.forEach(list => list.sort((a, b) => (b.weight || 0) - (a.weight || 0)));
+    const families = [...byType.keys()];
+    // Round-robin across families so every present family is represented before
+    // any single family consumes this node's budget.
+    let picked = 0, round = 0;
+    while (picked < PER_NODE_GHOSTS) {
+      let advanced = false;
+      for (const fam of families) {
+        const list = byType.get(fam);
+        if (round < list.length) {
+          typedGhostIds.add(list[round].to);
+          picked++;
+          advanced = true;
+          if (picked >= PER_NODE_GHOSTS) break;
+        }
+      }
+      if (!advanced) break; // all families exhausted
+      round++;
     }
-  }
-  // Second pass: fill remaining budget with highest-count uncapped ghosts
-  for (const [ghostId] of sortedGhostNoms) {
-    if (typedGhostIds.size >= MAX_TYPED_GHOSTS) break;
-    typedGhostIds.add(ghostId);
   }
 
   const typedGhostBestEdge = new Map();
@@ -464,6 +516,12 @@ async function loadGraph() {
     if (!typedGhostIds.has(e.to) || !nodeIds.has(e.from) || e.source === 'wikipedia_links') return;
     const prev = typedGhostBestEdge.get(e.to);
     if (!prev || (e.weight||0) > (prev.weight||0)) typedGhostBestEdge.set(e.to, e);
+  });
+
+  // Build edge-type lookup for ghost coloring (one color per ghost = highest-weight edge family)
+  const ghostEdgeTypeMap = new Map();
+  typedGhostBestEdge.forEach((edge, ghostId) => {
+    ghostEdgeTypeMap.set(ghostId, edge.type || null);
   });
 
   // Structural-only ghosts (not already in typed tier)
@@ -505,40 +563,61 @@ async function loadGraph() {
       y: p?.y ?? (cy + (Math.random()-.5)*300),
     };
   });
-  // Build a map of ghost → parent classified node (for ring-angle seeding)
-  const ghostParent = new Map();
+  // Build a map of ghost → parent classified node (for ring-angle seeding).
+  // Also build the per-parent sibling list, sorted by edge weight so the
+  // most strongly connected ghosts sit closest to the parent.
+  const ghostParent   = new Map();   // ghostId -> parentId
+  const parentGhosts  = new Map();   // parentId -> [{id, weight}, ...]
   frontierEdges.forEach(e => {
     const gId = !nodeIds.has(e.from) ? e.from : e.to;
     const pId = !nodeIds.has(e.from) ? e.to   : e.from;
     if (!ghostParent.has(gId)) ghostParent.set(gId, pId);
+    if (!parentGhosts.has(pId)) parentGhosts.set(pId, []);
+    parentGhosts.get(pId).push({ id: gId, weight: e.weight || 0 });
   });
+  parentGhosts.forEach(list => list.sort((a, b) => b.weight - a.weight));
+  const ghostSibIdx = new Map();
+  parentGhosts.forEach(list => list.forEach((g, idx) => ghostSibIdx.set(g.id, idx)));
 
-  const R = GHOST_RING_R();
+  // Per-parent spiral: each successive sibling sits RADIAL_STEP units further
+  // out from world center. Combined with a slight angular fan, this turns
+  // each classified node's ghost set into a comet-tail arm instead of a tight
+  // arc on a shared circle -- way less clutter at high ghost density.
+  const R           = GHOST_RING_R();
+  const RADIAL_STEP = 42;
+
   const ghostNodes = allGhostIds.map((id, i) => {
-    const existing = pos.get(id);
+    const isTyped       = typedGhostIds.has(id);
+    const ghostEdgeType = isTyped ? (ghostEdgeTypeMap.get(id) || null) : null;
+    const sibIdx        = ghostSibIdx.get(id) ?? 0;
+    const ringR         = R + sibIdx * RADIAL_STEP;
+    const existing      = pos.get(id);
     if (existing) {
       return {
         id, title: id, ghost: true, primary_domain: 'other', depth_score: 1,
-        typed_ghost: typedGhostIds.has(id),
+        typed_ghost: isTyped,
+        ghost_edge_type: ghostEdgeType,
+        ringR,
         x: existing.x, y: existing.y,
       };
     }
-    // New ghost: seed it on the ring, angled toward its parent classified node
+    // New ghost: seed it on the spiral, angled toward its parent classified node.
     const parentId  = ghostParent.get(id);
     const parentPos = parentId ? pos.get(parentId) : null;
     const baseAngle = parentPos
       ? Math.atan2(parentPos.y - cy, parentPos.x - cx)
       : (i / allGhostIds.length) * 2 * Math.PI;
-    // Spread multiple ghosts from the same parent with a small fan offset
-    const siblings = allGhostIds.filter(g => ghostParent.get(g) === parentId);
-    const sibIdx   = siblings.indexOf(id);
-    const spread   = siblings.length > 1 ? (sibIdx / siblings.length - 0.5) * 0.9 : 0;
+    // Spread siblings tightly in angle (radial step does most of the spread).
+    const siblings = parentGhosts.get(parentId) || [];
+    const spread   = siblings.length > 1 ? (sibIdx / siblings.length - 0.5) * 0.35 : 0;
     const angle    = baseAngle + spread;
     return {
       id, title: id, ghost: true, primary_domain: 'other', depth_score: 1,
-      typed_ghost: typedGhostIds.has(id),
-      x: cx + Math.cos(angle) * R,
-      y: cy + Math.sin(angle) * R,
+      typed_ghost: isTyped,
+      ghost_edge_type: ghostEdgeType,
+      ringR,
+      x: cx + Math.cos(angle) * ringR,
+      y: cy + Math.sin(angle) * ringR,
     };
   });
   gNodes = [...classifiedNodes, ...ghostNodes];
@@ -556,10 +635,78 @@ async function loadGraph() {
   // On load: fit the classified cluster at comfortable reading size.
   // Ghost ring is discoverable by zooming out (double-click fits everything).
   requestAnimationFrame(() => { if (!graphPanelOpen) fitGraph(700, true); });
+
+  // Free thumbnails for ghost nodes -- pulled straight from Wikipedia's
+  // pageimages endpoint (no LLM cost), cached in localStorage for 7 days.
+  // Fire-and-forget so this never blocks the first render.
+  applyGhostThumbnails(allGhostIds);
+}
+
+/* Batch-fetch Wikipedia thumbnails for ghost-node titles and apply them.
+ * Wikipedia's pageimages API accepts up to 50 titles per request; results
+ * (positive AND negative) are cached so we never re-hit the API for the
+ * same title within the TTL window. Costs nothing -- no LLM involved. */
+const _GHOST_THUMB_CACHE_KEY = 'wd_ghost_thumbs_v1';
+const _GHOST_THUMB_TTL_MS    = 7 * 24 * 60 * 60 * 1000;
+
+async function applyGhostThumbnails(titles) {
+  if (!Array.isArray(titles) || !titles.length) return;
+  let cache = {};
+  try { cache = JSON.parse(localStorage.getItem(_GHOST_THUMB_CACHE_KEY) || '{}'); } catch {}
+
+  const now    = Date.now();
+  const fresh  = {};   // title -> url (or null), for everything we now know
+  const need   = [];
+  for (const t of titles) {
+    const hit = cache[t];
+    if (hit && hit.expires > now) fresh[t] = hit.url || null;
+    else need.push(t);
+  }
+
+  for (let i = 0; i < need.length; i += 50) {
+    const batch = need.slice(i, i + 50);
+    // Wikipedia titles in titles= are joined by literal '|' -- but each title
+    // still needs URL-encoding because spaces and quotes are illegal in URLs.
+    const titlesParam = batch.map(encodeURIComponent).join('|');
+    try {
+      const r = await fetch(`${WIKI_API}?action=query&titles=${titlesParam}&prop=pageimages&piprop=thumbnail&pithumbsize=160&format=json&origin=*`);
+      if (!r.ok) continue;
+      const d = await r.json();
+      const pages = d.query?.pages || {};
+      const seen = new Set();
+      for (const page of Object.values(pages)) {
+        if (!page?.title) continue;
+        const t   = page.title;
+        const url = page.thumbnail?.source || null;
+        fresh[t]  = url;
+        cache[t]  = { url, expires: now + _GHOST_THUMB_TTL_MS };
+        seen.add(t);
+      }
+      // Cache "no thumbnail" entries too so we don't re-query missing pages.
+      for (const t of batch) {
+        if (!seen.has(t)) cache[t] = { url: null, expires: now + _GHOST_THUMB_TTL_MS };
+      }
+    } catch {}
+  }
+  try { localStorage.setItem(_GHOST_THUMB_CACHE_KEY, JSON.stringify(cache)); } catch {}
+
+  // Apply: only update ghosts that don't already have a thumbnail; only
+  // re-render if anything actually changed.
+  let changed = false;
+  for (const n of gNodes) {
+    if (!n.ghost) continue;
+    const url = fresh[n.id] ?? cache[n.id]?.url ?? null;
+    if (url && !n.thumbnail_url) { n.thumbnail_url = url; changed = true; }
+  }
+  // {reheat:false} skips simulation.alpha(0.7).restart() so the existing layout
+  // stays put -- only the new thumbnail patterns and the affected ghost-node
+  // visuals get patched in. Avoids the visible reshuffle that otherwise hits
+  // every page load right when thumbnails finish loading.
+  if (changed) renderGraph({ reheat: false });
 }
 
 /* ── Render / update graph ── */
-function renderGraph() {
+function renderGraph(opts = {}) {
   if (!simulation) simulation = makeSimulation();
   // Ghost ring lives in world space — center is always fixed
   const radial = simulation.force('ghost_radial');
@@ -572,7 +719,7 @@ function renderGraph() {
   // (Without viewBox the content defaults to world-space userSpaceOnUse, putting
   //  the image at SVG origin (0,0) — completely off-screen in world space.)
   svgDefs.selectAll('pattern.nip')
-    .data(gNodes.filter(n => !n.ghost && n.thumbnail_url), d => d.id)
+    .data(gNodes.filter(n => n.thumbnail_url), d => d.id)
     .join(
       enter => {
         const pat = enter.append('pattern')
@@ -605,10 +752,11 @@ function renderGraph() {
   const edgeKey = d => `${d.from}||${d.to}||${d.predicate}`;
 
   /* ── Edge visual lines ── */
-  const visLines = edgeVisG.selectAll('line.ev')
+  const visLines = edgeVisG.selectAll('path.ev')
     .data(gLinks, edgeKey)
     .join(
-      enter => enter.append('line').attr('class', d => `ev edge-visual et-${d.type||'structural'}`)
+      enter => enter.append('path').attr('class', d => `ev edge-visual et-${d.type||'structural'}`)
+        .attr('fill','none')
         .attr('stroke-opacity',0)
         .call(s => s.transition().duration(500).attr('stroke-opacity',
           d => isRichEdge(d) ? 0.78 : 0.45)),
@@ -635,17 +783,23 @@ function renderGraph() {
     return `<span class="et-badge" style="color:${ec}">${esc(d.type||'?')}</span><span class="et-pred">${esc(d.predicate)}</span>`;
   }
 
-  /* ── Edge hit areas — ALL edges hoverable; rich edges also clickable ── */
-  const hitLines = edgeHitG.selectAll('line.eh')
-    .data(gLinks, edgeKey)
-    .join('line')
-    .attr('class', d => `eh edge-hit${isRichEdge(d) ? ' clickable' : ''}`)
+  /* ── Edge hit areas — only the clickable (rich) edges get a hit path. ──
+     The ~550 structural/ghost edges aren't clickable (their clicks fall through
+     to the canvas), so giving them invisible 16px hit paths just doubled the
+     edge element count and made every pan/mousemove hit-test hundreds of
+     decorative lines. Binding hit paths to rich edges only roughly halves the
+     edge DOM and removes that hit-testing entirely. */
+  const hitLines = edgeHitG.selectAll('path.eh')
+    .data(gLinks.filter(isRichEdge), edgeKey)
+    .join('path')
+    .attr('class', 'eh edge-hit clickable')
+    .attr('fill','none')
     .attr('stroke','transparent')
-    .attr('stroke-width', d => isRichEdge(d) ? 16 : 10)
+    .attr('stroke-width', 16)
     .on('mouseenter', (event, d) => {
       // Fade all vis lines; un-fade the hovered one using datum identity (not index)
-      edgeVisG.selectAll('line.ev').classed('faded', true);
-      edgeVisG.selectAll('line.ev')
+      edgeVisG.selectAll('path.ev').classed('faded', true);
+      edgeVisG.selectAll('path.ev')
         .filter(dd => edgeKey(dd) === edgeKey(d))
         .classed('faded', false).classed('hovered', true);
       tooltip.innerHTML = edgeTip(d);
@@ -654,7 +808,7 @@ function renderGraph() {
     })
     .on('mousemove', (event) => moveTooltip(event, tooltip))
     .on('mouseleave', () => {
-      edgeVisG.selectAll('line.ev').classed('faded',false).classed('hovered',false);
+      edgeVisG.selectAll('path.ev').classed('faded',false).classed('hovered',false);
       tooltip.style.display = 'none';
     })
     .on('click', (event, d) => {
@@ -765,21 +919,55 @@ function renderGraph() {
       return;
     }
 
-    // Ghost (frontier) nodes — visible dim dots, clickable
-    // Typed ghosts (connected via a real relationship) are slightly brighter and larger
+    // Ghost (frontier) nodes -- visible dim dots, clickable.
+    // Typed ghosts are colored by their edge-type family; structural ghosts
+    // use a neutral blue. When a Wikipedia thumbnail is available we promote
+    // the ghost to a small circular image with the family color as its border.
     if (d.ghost) {
-      const isTyped = d.typed_ghost;
+      const isTyped   = d.typed_ghost;
+      const hasImg    = !!d.thumbnail_url;
+      const typeColor = isTyped && d.ghost_edge_type
+        ? (EDGE_COLOR[d.ghost_edge_type] || '#4488cc')
+        : null;
+      const mainColor  = typeColor || (isTyped ? '#4488cc' : '#2d5590');
+      const glowColor  = typeColor || (isTyped ? '#3377bb' : '#1e4070');
+      const labelColor = typeColor || (isTyped ? '#4488cc' : '#2a4a7a');
+
+      if (hasImg) {
+        // Circular thumbnail. Larger than the plain dot so the image reads.
+        const r = isTyped ? 17 : 13;
+        g.select('.node-main').attr('r', r)
+          .attr('fill', `url(#${nodePatternId(d.id)})`)
+          .attr('opacity', isTyped ? 1 : 0.85)
+          .attr('stroke', mainColor)
+          .attr('stroke-width', 1.6);
+        g.select('.node-glow').attr('r', r + 5)
+          .attr('fill', glowColor)
+          .attr('opacity', isTyped ? 0.22 : 0.12);
+        g.select('.node-ring').attr('r', 0).attr('stroke', 'none');
+        g.select('.node-conquest-ring').attr('opacity', 0);
+        g.select('.node-core').attr('r', 0);
+        g.select('.node-label')
+          .attr('fill', labelColor)
+          .attr('dy', r + 12)
+          .attr('opacity', isTyped ? 0.95 : 0.7)
+          .text(truncLabel(d.title));
+        return;
+      }
+
+      // No thumbnail yet (still loading, or no image on Wikipedia) -- plain dot.
       g.select('.node-main').attr('r', isTyped ? 6 : 4)
-        .attr('fill', isTyped ? '#4488cc' : '#2d5590')
-        .attr('opacity', isTyped ? 0.85 : 0.55);
+        .attr('fill', mainColor)
+        .attr('opacity', isTyped ? 0.85 : 0.55)
+        .attr('stroke', 'none');
       g.select('.node-glow').attr('r', isTyped ? 11 : 7)
-        .attr('fill', isTyped ? '#3377bb' : '#1e4070')
+        .attr('fill', glowColor)
         .attr('opacity', isTyped ? 0.28 : 0.14);
       g.select('.node-ring').attr('r', 0).attr('stroke', 'none');
       g.select('.node-conquest-ring').attr('opacity', 0);
       g.select('.node-core').attr('r', 0);
       g.select('.node-label')
-        .attr('fill', isTyped ? '#4488cc' : '#2a4a7a')
+        .attr('fill', labelColor)
         .attr('dy', isTyped ? 20 : 16)
         .attr('opacity', isTyped ? 0.9 : 0.55)
         .text(truncLabel(d.title));
@@ -823,19 +1011,25 @@ function renderGraph() {
   /* ── Simulation tick ── */
   simulation.nodes(gNodes);
   simulation.force('link').links(gLinks);
+  // Tick is the hot path (runs every animation frame). Reuse the selections
+  // captured above instead of re-querying the DOM with selectAll each frame,
+  // and only run the spotlight repositioning when a spotlight is actually active.
   simulation.on('tick', () => {
-    visLines
-      .attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
-      .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
-    hitLines
-      .attr('x1',d=>d.source.x).attr('y1',d=>d.source.y)
-      .attr('x2',d=>d.target.x).attr('y2',d=>d.target.y);
-    nodeG.selectAll('g.node')
-      .attr('transform', d => `translate(${d.x ?? 0},${d.y ?? 0})`);
-    _tickSpotlight();
+    visLines.attr('d', linkPath);
+    hitLines.attr('d', linkPath);
+    nodeGrps.attr('transform', d => `translate(${d.x ?? 0},${d.y ?? 0})`);
+    if (_spotlightNodeId) _tickSpotlight();
   });
 
-  simulation.alpha(0.7).restart();
+  if (opts.reheat !== false) {
+    simulation.alpha(0.7).restart();
+  } else {
+    // Patch-only update (e.g. ghost thumbnails arriving). Run one tick so the
+    // attribute changes above commit, but don't reheat alpha -- the existing
+    // layout stays exactly where it is and nothing visually shuffles.
+    simulation.tick();
+    nodeG.selectAll('g.node').attr('transform', d => `translate(${d.x ?? 0},${d.y ?? 0})`);
+  }
 
   // After simulation settles, fit the view once
   simulation.on('end', () => {
@@ -889,19 +1083,42 @@ function _neighborSet(id) {
   return nbrs;
 }
 
-/* ── Spotlight ghost ring: Wikipedia links rendered in a wide outer ring ── */
+/* Point on an edge's curve at t=0.5 (matches linkPath's quadratic control point),
+   so an edge label sits ON the visible curve, halfway along it. */
+function _edgeMid(d) {
+  const s = d.source, t = d.target;
+  if (!s || !t || s.x == null || t.x == null) return [0, 0];
+  const x1 = s.x, y1 = s.y, x2 = t.x, y2 = t.y;
+  const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1;
+  const curv = d._ghost_edge ? 0.07 : 0.15;
+  const cx = (x1 + x2) / 2 + (-dy / len) * len * curv;
+  const cy = (y1 + y2) / 2 + ( dx / len) * len * curv;
+  return [0.25 * x1 + 0.5 * cx + 0.25 * x2, 0.25 * y1 + 0.5 * cy + 0.25 * y2];
+}
+
+/* ── Spotlight per-frame positioning: outer Wikipedia ring + edge labels ── */
 function _tickSpotlight() {
-  if (!_spotlightNodeId || !_spotlightNodes.length) return;
+  if (!_spotlightNodeId) return;
   const anchor = gNodes.find(n => n.id === _spotlightNodeId);
   if (!anchor || anchor.x == null) return;
-  const R = 1600;
-  const n = _spotlightNodes.length;
-  spotlightLinkG.selectAll('line.sl')
-    .attr('x1', anchor.x).attr('y1', anchor.y)
-    .attr('x2', d => anchor.x + R * Math.cos(d.angle))
-    .attr('y2', d => anchor.y + R * Math.sin(d.angle));
-  spotlightNodesG.selectAll('g.sg')
-    .attr('transform', d => `translate(${anchor.x + R * Math.cos(d.angle)},${anchor.y + R * Math.sin(d.angle)})`);
+
+  // Outer Wikipedia-link ring (unchanged)
+  if (_spotlightNodes.length) {
+    const R = 1600;
+    spotlightLinkG.selectAll('line.sl')
+      .attr('x1', anchor.x).attr('y1', anchor.y)
+      .attr('x2', d => anchor.x + R * Math.cos(d.angle))
+      .attr('y2', d => anchor.y + R * Math.sin(d.angle));
+    spotlightNodesG.selectAll('g.sg')
+      .attr('transform', d => `translate(${anchor.x + R * Math.cos(d.angle)},${anchor.y + R * Math.sin(d.angle)})`);
+  }
+
+  // Predicate labels sitting halfway along each connected edge
+  if (_spotlightEdges.length) {
+    spotlightEdgeLabelsG.selectAll('text.sel')
+      .attr('x', d => _edgeMid(d)[0])
+      .attr('y', d => _edgeMid(d)[1]);
+  }
 }
 
 function _renderSpotlightGhosts(nodeId, links) {
@@ -912,22 +1129,36 @@ function _renderSpotlightGhosts(nodeId, links) {
   // Only show links not already present in the graph as any node type
   const existing = new Set(gNodes.map(n => n.id));
   const fresh = links.filter(t => !existing.has(t));
-  const MAX = 150;
+  // Cap matches the upstream Wikipedia API ceiling (pllimit=max = 500), so a node
+  // can surface every link it actually has -- not an arbitrary subset.
+  const MAX = 500;
   const count = Math.min(fresh.length, MAX);
   _spotlightNodes = fresh.slice(0, count).map((title, i) => ({
     id: title, title,
     angle: (2 * Math.PI * i) / count,
   }));
 
+  // Visual scaling: scale dots and labels with count so a 500-dot ring is still
+  // readable. Labels are ALWAYS rendered (the article title is the point of the
+  // ring) -- they just shrink as count rises.
+  const dotR        = count <= 40 ? 4.5 : count <= 120 ? 3.5 : count <= 250 ? 2.6 : 2.0;
+  const labelSize   = count <= 20 ? '13px'
+                    : count <= 60 ? '11px'
+                    : count <= 150 ? '10px'
+                    : count <= 300 ? '9px'
+                    : '8px';
+  const lineOpacity = count <= 80 ? 0.18 : count <= 200 ? 0.11 : 0.06;
+  const labelFill   = '#0d2640';  // var(--text); deep navy reads cleanly on the white background
+
   // Lines from anchor to each link ghost
   spotlightLinkG.selectAll('line.sl')
     .data(_spotlightNodes, d => d.id)
     .join(
       enter => enter.append('line').attr('class','sl')
-        .attr('stroke', 'rgba(120,160,220,0.1)')
+        .attr('stroke', `rgba(120,160,220,${lineOpacity})`)
         .attr('stroke-width', 0.5)
         .attr('pointer-events', 'none'),
-      update => update,
+      update => update.attr('stroke', `rgba(120,160,220,${lineOpacity})`),
       exit   => exit.remove()
     );
 
@@ -940,25 +1171,66 @@ function _renderSpotlightGhosts(nodeId, links) {
           .attr('opacity', 0)
           .call(s => s.transition().duration(500).attr('opacity', 1));
         g.append('circle')
-          .attr('r', 3.5)
-          .attr('fill', '#0a1a2e')
-          .attr('stroke', 'rgba(120,170,240,0.45)')
-          .attr('stroke-width', 1);
+          .attr('r', dotR)
+          .attr('fill', '#0d2640')
+          .attr('stroke', 'rgba(60,110,180,0.75)')
+          .attr('stroke-width', 1.2);
+        // Labels are positioned RADIALLY OUTWARD from the spotlight ring
+        // center. With horizontal anchor/baseline keyed to each dot's angle,
+        // labels at the top of the ring fly UP, labels at the bottom fly
+        // DOWN, labels on the right extend rightward, etc. -- so adjacent
+        // labels can no longer eclipse each other vertically the way they
+        // did when all of them were dropped below the dot.
+        const off = dotR + 7;
+        const labelX = d => {
+          const c = Math.cos(d.angle);
+          return Math.abs(c) < 0.2 ? 0 : c * off;
+        };
+        const labelY = d => {
+          const s = Math.sin(d.angle);
+          return Math.abs(s) < 0.2 ? 0 : s * off;
+        };
+        const labelAnchor = d => {
+          const c = Math.cos(d.angle);
+          return c > 0.2 ? 'start' : c < -0.2 ? 'end' : 'middle';
+        };
+        const labelBaseline = d => {
+          const s = Math.sin(d.angle);
+          return s > 0.2 ? 'hanging' : s < -0.2 ? 'auto' : 'middle';
+        };
         g.append('text')
-          .attr('text-anchor', 'middle')
-          .attr('font-family', 'Share Tech Mono,monospace')
-          .attr('font-size', '8px')
-          .attr('fill', 'rgba(120,160,210,0.6)')
-          .attr('dy', 13)
+          .attr('class', 'sg-label')
+          .attr('font-family', 'Rajdhani,Arial,sans-serif')
+          .attr('font-weight', 600)
+          .attr('font-size', labelSize)
+          .attr('fill', labelFill)
+          .attr('x', labelX)
+          .attr('y', labelY)
+          .attr('text-anchor', labelAnchor)
+          .attr('dominant-baseline', labelBaseline)
           .attr('pointer-events', 'none')
           .text(d => truncLabel(d.title));
+        // Native title tooltip shows the FULL title on hover, even when the
+        // visible label is truncated.
+        g.append('title').text(d => d.title);
         g.on('click', (event, d) => {
           event.stopPropagation();
           showArticleForTitle(d.title);
         });
         return g;
       },
-      update => update,
+      update => {
+        const off = dotR + 7;
+        update.select('circle').attr('r', dotR);
+        update.select('text.sg-label')
+          .attr('font-size', labelSize)
+          .attr('fill', labelFill)
+          .attr('x', d => { const c = Math.cos(d.angle); return Math.abs(c) < 0.2 ? 0 : c * off; })
+          .attr('y', d => { const s = Math.sin(d.angle); return Math.abs(s) < 0.2 ? 0 : s * off; })
+          .attr('text-anchor', d => { const c = Math.cos(d.angle); return c > 0.2 ? 'start' : c < -0.2 ? 'end' : 'middle'; })
+          .attr('dominant-baseline', d => { const s = Math.sin(d.angle); return s > 0.2 ? 'hanging' : s < -0.2 ? 'auto' : 'middle'; });
+        return update;
+      },
       exit => exit.transition().duration(200).attr('opacity', 0).remove()
     );
 
@@ -973,24 +1245,131 @@ function clearSpotlightGhosts() {
     .transition().duration(200).attr('opacity', 0).remove();
 }
 
-/* ── Spotlight: full dim of non-connected nodes + edge reveal + outer link ring ── */
-async function applySpotlight(id) {
-  _spotlightNodeId = id;
+/* Apply ONLY the dim/reveal classes for a spotlight on `id`. Cheap and
+   idempotent -- used both by the full applySpotlight and to restore the
+   spotlight after a transient hover (without re-laying-out the circle). */
+function _applySpotlightClasses(id) {
+  const nbrs = _neighborSet(id);
+  const isConnected = d => {
+    const s = typeof d.source === 'object' ? d.source.id : d.source;
+    const t = typeof d.target === 'object' ? d.target.id : d.target;
+    return s === id || t === id;
+  };
+  nodeG.selectAll('g.node').classed('selected', d => nbrs.has(d.id));
+  edgeVisG.selectAll('path.ev')
+    .classed('connected', isConnected)
+    .classed('faded',     d => !isConnected(d));
+  edgeHitG.selectAll('path.eh').classed('connected', isConnected);
+  svg.classed('spotlight', true);
+}
+
+/* Pin the spotlight node's neighbors into an even circle around it (fx/fy), so
+   spotlight reads as a clean radial diagram. Returns the circle radius. */
+function _layoutSpotlightCircle(id) {
+  const anchor = gNodes.find(n => n.id === id);
+  if (!anchor) return 0;
+  _spotlightPinned.forEach(nid => { const n = gNodes.find(g => g.id === nid); if (n) { n.fx = null; n.fy = null; } });
 
   const nbrs = _neighborSet(id);
-  nodeG.selectAll('g.node').classed('selected', d => nbrs.has(d.id));
-  edgeVisG.selectAll('line.ev')
-    .classed('connected', d => {
-      const s = typeof d.source === 'object' ? d.source.id : d.source;
-      const t = typeof d.target === 'object' ? d.target.id : d.target;
-      return s === id || t === id;
-    })
-    .classed('faded', d => {
-      const s = typeof d.source === 'object' ? d.source.id : d.source;
-      const t = typeof d.target === 'object' ? d.target.id : d.target;
-      return s !== id && t !== id;
-    });
-  svg.classed('spotlight', true);
+  const neighbors = gNodes.filter(n => n.id !== id && nbrs.has(n.id));
+
+  const N = neighbors.length;
+  if (!N) { _spotlightPinned = []; _spotlightCircleR = 0; return 0; }
+
+  const MIN_DIST = 280;
+  const MAX_DIST = Math.max(650, N * 38);
+  const MIN_SEP  = 180;
+
+  anchor.fx = anchor.x; anchor.fy = anchor.y;
+  const ax = anchor.x, ay = anchor.y;
+
+  const placed = neighbors.map(n => {
+    let dx = n.x - ax, dy = n.y - ay;
+    let dist = Math.hypot(dx, dy) || 1;
+    const ux = dx / dist, uy = dy / dist;
+    const clamped = Math.max(MIN_DIST, Math.min(dist, MAX_DIST));
+    return { n, x: ax + ux * clamped, y: ay + uy * clamped, ux, uy, dist: clamped };
+  });
+
+  for (let pass = 0; pass < 3; pass++) {
+    for (let i = 0; i < placed.length; i++) {
+      for (let j = i + 1; j < placed.length; j++) {
+        const a = placed[i], b = placed[j];
+        let sdx = b.x - a.x, sdy = b.y - a.y;
+        const sep = Math.hypot(sdx, sdy) || 1;
+        if (sep < MIN_SEP) {
+          const push = (MIN_SEP - sep) / 2;
+          const pux = sdx / sep, puy = sdy / sep;
+          a.x -= pux * push; a.y -= puy * push;
+          b.x += pux * push; b.y += puy * push;
+          a.dist = Math.hypot(a.x - ax, a.y - ay);
+          b.dist = Math.hypot(b.x - ax, b.y - ay);
+        }
+      }
+    }
+  }
+
+  let maxR = 0;
+  placed.forEach(p => {
+    p.n.fx = p.n.x = p.x;
+    p.n.fy = p.n.y = p.y;
+    maxR = Math.max(maxR, Math.hypot(p.x - ax, p.y - ay));
+  });
+
+  _spotlightPinned = [anchor.id, ...neighbors.map(n => n.id)];
+  _spotlightCircleR = maxR;
+  if (simulation) simulation.alpha(0.3).restart();
+  return maxR;
+}
+
+/* Render a predicate label at the midpoint of every connected edge. */
+function _renderSpotlightEdgeLabels(id) {
+  const connected = gLinks.filter(l => {
+    const s = typeof l.source === 'object' ? l.source.id : l.source;
+    const t = typeof l.target === 'object' ? l.target.id : l.target;
+    return s === id || t === id;
+  });
+  _spotlightEdges = connected;
+  spotlightEdgeLabelsG.selectAll('text.sel')
+    .data(connected, d => `${d.from}||${d.to}||${d.predicate}`)
+    .join(
+      enter => enter.append('text').attr('class', 'sel')
+        .attr('text-anchor', 'middle').attr('dominant-baseline', 'middle')
+        .attr('pointer-events', 'none')
+        .attr('opacity', 0)
+        .call(s => s.transition().duration(400).attr('opacity', 1))
+        .text(d => d.predicate || 'links to'),
+      update => update.text(d => d.predicate || 'links to'),
+      exit => exit.remove()
+    );
+  _tickSpotlight();
+}
+
+/* Frame the spotlight circle centered in the visible area (respecting the
+   open detail panel on desktop / the peek sheet on mobile). */
+function _frameSpotlight(anchor, R, dur = 600) {
+  if (!anchor || anchor.x == null) return;
+  const mobile = window.innerWidth <= 768;
+  const sheet  = graphPanelOpen && mobile && $('detail-panel').classList.contains('peek');
+  const pw = (graphPanelOpen && !mobile)
+    ? parseInt(getComputedStyle(document.documentElement).getPropertyValue('--panel-w') || '440') : 0;
+  const ph = sheet ? Math.round(H() * 0.46) : 0;
+  const vw = W() - pw, vh = H() - ph;
+  const span = 2 * (R + 160);                 // diameter + room for outer labels
+  const scale = Math.min((vw - 120) / span, (vh - 120) / span, 1.3);
+  const tx = vw / 2 - scale * anchor.x;
+  const ty = vh / 2 - scale * anchor.y;
+  svg.transition().duration(dur)
+    .call(zoomBehavior.transform, d3.zoomIdentity.translate(tx, ty).scale(scale));
+}
+
+/* ── Spotlight: dim non-connected + radial circle of neighbors + edge labels
+      + outer Wikipedia-link ring ── */
+async function applySpotlight(id) {
+  _spotlightNodeId = id;
+  _applySpotlightClasses(id);
+  _layoutSpotlightCircle(id);
+  _renderSpotlightEdgeLabels(id);
 
   // Fetch Wikipedia links and render as a wider outer ghost ring
   try {
@@ -1005,7 +1384,17 @@ async function applySpotlight(id) {
 function clearSpotlight() {
   svg.classed('spotlight', false);
   nodeG.selectAll('g.node').classed('selected', false).classed('nb-dim', false);
-  edgeVisG.selectAll('line.ev').classed('faded', false).classed('connected', false).classed('hovered', false);
+  edgeVisG.selectAll('path.ev').classed('faded', false).classed('connected', false).classed('hovered', false);
+  edgeHitG.selectAll('path.eh').classed('connected', false);
+  // release the pinned circle so the graph relaxes back
+  if (_spotlightPinned.length) {
+    _spotlightPinned.forEach(nid => { const n = gNodes.find(g => g.id === nid); if (n) { n.fx = null; n.fy = null; } });
+    _spotlightPinned = [];
+    _spotlightCircleR = 0;
+    if (simulation) simulation.alpha(0.4).restart();
+  }
+  _spotlightEdges = [];
+  spotlightEdgeLabelsG.selectAll('text.sel').remove();
   clearSpotlightGhosts();
 }
 
@@ -1030,7 +1419,7 @@ function highlightNeighbors(id, on) {
     nodeG.selectAll('g.node')
       .classed('selected', d => nbrs.has(d.id))
       .classed('nb-dim',   d => !nbrs.has(d.id));
-    edgeVisG.selectAll('line.ev').classed('faded', d => {
+    edgeVisG.selectAll('path.ev').classed('faded', d => {
       const s = typeof d.source === 'object' ? d.source.id : d.source;
       const t = typeof d.target === 'object' ? d.target.id : d.target;
       return s !== id && t !== id;
@@ -1038,10 +1427,13 @@ function highlightNeighbors(id, on) {
   } else {
     nodeG.selectAll('g.node').classed('nb-dim', false);
     if (selectedNodeId) {
-      applySpotlight(selectedNodeId);
+      // Restore the active spotlight's dim/reveal classes only -- do NOT re-run
+      // the full applySpotlight (that would re-layout the circle and refetch the
+      // ring on every hover-out).
+      _applySpotlightClasses(selectedNodeId);
     } else {
       nodeG.selectAll('g.node').classed('selected', false);
-      edgeVisG.selectAll('line.ev').classed('faded', false);
+      edgeVisG.selectAll('path.ev').classed('faded', false);
     }
   }
 }
@@ -1060,9 +1452,12 @@ function fitGraph(dur=600, classifiedOnly=false) {
   if (!xs.length) return;
   const minX=Math.min(...xs), maxX=Math.max(...xs);
   const minY=Math.min(...ys), maxY=Math.max(...ys);
-  const pw = graphPanelOpen && window.innerWidth > 768
+  const mobile = window.innerWidth <= 768;
+  const sheet  = graphPanelOpen && mobile && $('detail-panel').classList.contains('peek');
+  const pw = (graphPanelOpen && !mobile)
     ? parseInt(getComputedStyle(document.documentElement).getPropertyValue('--panel-w') || '440') : 0;
-  const vw = W() - pw, vh = H();
+  const ph = sheet ? Math.round(H() * 0.46) : 0;  // bottom sheet height reserved on mobile
+  const vw = W() - pw, vh = H() - ph;
   const pad = classifiedOnly ? 120 : 60;
   const scaleX = (vw-2*pad) / (maxX-minX||1);
   const scaleY = (vh-2*pad) / (maxY-minY||1);
@@ -1077,14 +1472,16 @@ function fitGraph(dur=600, classifiedOnly=false) {
     .call(zoomBehavior.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
 }
 
-function focusNode(id) {
+function focusNode(id, scale = 1.9) {
   const n = gNodes.find(d => d.id === id);
   if (!n) return;
-  const scale = 1.9;
-  const pw = graphPanelOpen && window.innerWidth>768
+  const mobile = window.innerWidth <= 768;
+  const sheet  = graphPanelOpen && mobile && $('detail-panel').classList.contains('peek');
+  const pw = (graphPanelOpen && !mobile)
     ? parseInt(getComputedStyle(document.documentElement).getPropertyValue('--panel-w')||'440') : 0;
+  const ph = sheet ? Math.round(H() * 0.46) : 0;
   const tx = (W()-pw)/2 - scale*n.x;
-  const ty = H()/2 - scale*n.y;
+  const ty = (H()-ph)/2 - scale*n.y;
   svg.transition().duration(600)
     .call(zoomBehavior.transform, d3.zoomIdentity.translate(tx,ty).scale(scale));
 }
@@ -1204,6 +1601,11 @@ function enterPathMode(fromTitle, toTitle, sessionId) {
   pathTo        = toTitle;
   pathSessionId = sessionId;
   pathResults   = [];
+
+  // Tear down any active spotlight from the main graph -- otherwise the SVG
+  // ring of link ghosts hangs around on top of the path canvas.
+  selectedNodeId = null;
+  clearSpotlight();
 
   // Save current graph so we can restore on exit
   savedGraph = { gNodes: [...gNodes], gLinks: [...gLinks], rawNodes: { ...rawNodes } };
@@ -1348,7 +1750,7 @@ function renderPathPanel(phase) {
     </div>
     <div class="pf-cards" id="pf-cards">
       ${cardsHTML || (phase === 'searching'
-          ? '<div class="pf-no-path">Branches growing…</div>'
+          ? '<div class="pf-no-path">Classifying endpoints, then mapping branches and finding connections… this typically takes 30–90 seconds when both endpoints are new.</div>'
           : '<div class="pf-no-path">No direct connections found. Intermediate articles have been queued — classify more nodes and run this path again.</div>'
         )}
     </div>
@@ -1563,27 +1965,90 @@ function setupPfAc(inputId, dropdownId) {
       if (e.key === 'ArrowDown') { e.preventDefault(); sel = Math.min(sel + 1, items.length - 1); renderAcLocal(); return; }
       if (e.key === 'ArrowUp')   { e.preventDefault(); sel = Math.max(sel - 1, -1); renderAcLocal(); return; }
       if (e.key === 'Enter' && sel >= 0) { e.preventDefault(); inp.value = items[sel].title; closeAcLocal(); return; }
+      if (e.key === 'Enter') {
+        // Dropdown open but nothing arrow-selected: auto-pick the top suggestion
+        // so the input always carries a canonical title, not partial text.
+        e.preventDefault();
+        inp.value = items[0].title;
+        closeAcLocal();
+        return;
+      }
       if (e.key === 'Escape') { closeAcLocal(); return; }
     }
   });
   inp.addEventListener('blur', () => setTimeout(closeAcLocal, 160));
 }
 
-async function startPathFind() {
-  const fromTitle = ($('pf-from-input')?.value || '').trim();
-  const toTitle   = ($('pf-to-input')?.value   || '').trim();
+/* Resolve raw user input to a canonical Wikipedia article title.
+ * Used by EVERY search submit path -- main search bar, path-finder inputs --
+ * so partial inputs like "max hea" become "Max Headroom" before they reach
+ * classification or path-finding. Order: exact DB match (cheapest, already
+ * canonical) -> Wikipedia opensearch top result. Returns null if nothing
+ * resolves (caller surfaces an error). */
+async function resolveToWikipediaTitle(raw) {
+  const q = (raw || '').trim();
+  if (!q) return null;
+  // 1. Exact DB hit -- a classified node's title is already canonical.
+  try {
+    const r = await fetch(`${SEARCH_API}?q=${encodeURIComponent(q)}`);
+    if (r.ok) {
+      const d = await r.json();
+      const exact = d.results?.find(n => n.title.toLowerCase() === q.toLowerCase());
+      if (exact) return exact.title;
+    }
+  } catch {}
+  // 2. Wikipedia opensearch top result (with redirect resolution).
+  //    Guard r.ok BEFORE r.json() -- a 429 returns an HTML page that would
+  //    otherwise throw "Unexpected token <" out of the parser.
+  try {
+    const r = await fetch(`${WIKI_API}?action=opensearch&search=${encodeURIComponent(q)}&limit=1&redirects=resolve&format=json&origin=*`);
+    if (!r.ok) return null;
+    const d = await r.json();
+    return (d[1] || [])[0] || null;
+  } catch { return null; }
+}
 
-  if (!fromTitle || !toTitle) {
+async function startPathFind() {
+  const rawFrom = ($('pf-from-input')?.value || '').trim();
+  const rawTo   = ($('pf-to-input')?.value   || '').trim();
+
+  if (!rawFrom || !rawTo) {
     showToast('Enter both article titles', 2500);
-    return;
-  }
-  if (fromTitle === toTitle) {
-    showToast('Choose two different articles', 2500);
     return;
   }
 
   const goBtn = $('btn-pf-go');
-  if (goBtn) { goBtn.disabled = true; goBtn.textContent = 'Starting...'; }
+  if (goBtn) { goBtn.disabled = true; goBtn.textContent = 'Resolving titles…'; }
+
+  // Resolve each input to a canonical Wikipedia title BEFORE submitting.
+  // Prevents partial inputs (e.g. "max hea") from being treated as articles.
+  const [fromTitle, toTitle] = await Promise.all([
+    resolveToWikipediaTitle(rawFrom),
+    resolveToWikipediaTitle(rawTo),
+  ]);
+
+  if (!fromTitle) {
+    showToast(`No Wikipedia article matches "${rawFrom}"`, 3500);
+    if (goBtn) { goBtn.disabled = false; goBtn.textContent = 'FIND PATH'; }
+    return;
+  }
+  if (!toTitle) {
+    showToast(`No Wikipedia article matches "${rawTo}"`, 3500);
+    if (goBtn) { goBtn.disabled = false; goBtn.textContent = 'FIND PATH'; }
+    return;
+  }
+  if (fromTitle === toTitle) {
+    showToast('Choose two different articles', 2500);
+    if (goBtn) { goBtn.disabled = false; goBtn.textContent = 'FIND PATH'; }
+    return;
+  }
+
+  // Reflect resolved titles back into the inputs so the user sees what was
+  // actually submitted -- e.g. "max hea" updates to "Max Headroom".
+  const fromInp = $('pf-from-input'); if (fromInp) fromInp.value = fromTitle;
+  const toInp   = $('pf-to-input');   if (toInp)   toInp.value   = toTitle;
+
+  if (goBtn) goBtn.textContent = 'Starting...';
 
   try {
     const r = await fetch(PATHFIND_API, {
@@ -1851,6 +2316,43 @@ async function showArticleForTitle(title) {
 
   const wikiUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(wiki.title.replace(/ /g,'_'))}`;
   setPanelHeader(wiki.title, null, wikiUrl);
+
+  // ── Disambiguation pages: not a classifiable article. They are pure navigation
+  //    hubs, so instead of a Classify button we surface ALL their links as
+  //    clickable entries — click any to open the real article you meant. ──
+  if (wiki.is_disambiguation) {
+    const links = wiki.outbound_links || [];
+    const linkRows = links.map(t =>
+      `<button class="disambig-link" data-title="${esc(t)}">
+         <span class="disambig-link-name">${esc(t)}</span>
+         <span class="disambig-link-arrow">→</span>
+       </button>`
+    ).join('');
+    setHTML($('pc-article'), `
+      <div class="art-title">${esc(wiki.title)}</div>
+      <div class="disambig-notice">
+        <span class="disambig-badge">DISAMBIGUATION</span>
+        <p>This isn't a single article — it's a set of topics that share the name
+           <strong>${esc(wiki.title)}</strong>. It can't be classified onto the map.
+           Pick the one you meant:</p>
+      </div>
+      <div class="disambig-links" id="disambig-links">
+        ${linkRows || '<div class="disambig-empty">No links found on this page.</div>'}
+      </div>
+      <hr class="art-sep">
+      <div class="art-meta"><span>${links.length} topic${links.length !== 1 ? 's' : ''}</span></div>
+    `);
+    const container = $('disambig-links');
+    if (container) {
+      container.addEventListener('click', e => {
+        const btn = e.target.closest('.disambig-link');
+        if (btn) showArticleForTitle(btn.dataset.title);
+      });
+    }
+    showPC('pc-article');
+    openPanel('article');
+    return;
+  }
 
   function splitAtBoundary(text, target=600) {
     if (text.length <= target) return [text, ''];
@@ -2244,18 +2746,21 @@ async function fetchWikipedia(topic) {
     throw new Error('Only English Wikipedia (en.wikipedia.org) is supported');
   }
 
-  const r = await fetch(`${WIKI_API}?action=query&titles=${encodeURIComponent(title)}&prop=extracts%7Clinks&exintro=false&explaintext=true&pllimit=max&plnamespace=0&redirects=1&format=json&origin=*`);
+  const PROPS = 'prop=extracts%7Clinks%7Cpageprops&ppprop=disambiguation';
+  const r = await fetch(`${WIKI_API}?action=query&titles=${encodeURIComponent(title)}&${PROPS}&exintro=false&explaintext=true&pllimit=max&plnamespace=0&redirects=1&format=json&origin=*`);
   if (!r.ok) throw new Error('Wikipedia request failed');
   const d = await r.json();
   let page = Object.values(d.query.pages)[0];
 
   if ('missing' in page) {
-    
+
     const sr = await fetch(`${WIKI_API}?action=query&list=search&srsearch=${encodeURIComponent(title)}&srlimit=1&format=json&origin=*`);
+    if (!sr.ok) throw new Error(`No Wikipedia article found for "${title}"`);
     const sd = await sr.json();
     const found = sd.query?.search?.[0]?.title;
     if (!found) throw new Error(`No Wikipedia article found for "${title}"`);
-    const r2 = await fetch(`${WIKI_API}?action=query&titles=${encodeURIComponent(found)}&prop=extracts%7Clinks&exintro=false&explaintext=true&pllimit=max&plnamespace=0&redirects=1&format=json&origin=*`);
+    const r2 = await fetch(`${WIKI_API}?action=query&titles=${encodeURIComponent(found)}&${PROPS}&exintro=false&explaintext=true&pllimit=max&plnamespace=0&redirects=1&format=json&origin=*`);
+    if (!r2.ok) throw new Error(`No Wikipedia article found for "${title}"`);
     const d2 = await r2.json();
     page = Object.values(d2.query.pages)[0];
     if ('missing' in page) throw new Error(`No Wikipedia article found for "${title}"`);
@@ -2266,11 +2771,17 @@ async function fetchWikipedia(topic) {
 
   const links = (page.links || []).map(l => l.title);
   const wc = text.split(/\s+/).length;
+  // Wikipedia flags disambiguation pages via the "disambiguation" page property.
+  // Fall back to the lead-text heuristic the pipeline uses ("X may refer to").
+  const isDisambiguation =
+    !!(page.pageprops && 'disambiguation' in page.pageprops) ||
+    /\bmay refer to\b/i.test(text.slice(0, 500));
   return {
-    title:          page.title,
-    text:           text.length > 8000 ? text.slice(0,8000)+'\n[truncated]' : text,
-    outbound_links: links,
-    word_count:     wc,
+    title:             page.title,
+    text:              text.length > 8000 ? text.slice(0,8000)+'\n[truncated]' : text,
+    outbound_links:    links,
+    word_count:        wc,
+    is_disambiguation: isDisambiguation,
   };
 }
 
@@ -2420,9 +2931,35 @@ document.addEventListener('DOMContentLoaded', () => {
       if (e.key==='ArrowDown') { e.preventDefault(); acSel=Math.min(acSel+1,acItems.length-1); renderAc(); return; }
       if (e.key==='ArrowUp')   { e.preventDefault(); acSel=Math.max(acSel-1,-1); renderAc(); return; }
       if (e.key==='Enter' && acSel>=0) { e.preventDefault(); const it=acItems[acSel]; inp.value=it.title; closeAc(); handleSearch(it.title); return; }
+      if (e.key==='Enter') {
+        // Dropdown is open with suggestions but the user didn't arrow-select.
+        // Pick the top suggestion -- that is what the autocomplete pointed at.
+        e.preventDefault();
+        const it = acItems[0];
+        inp.value = it.title;
+        closeAc();
+        handleSearch(it.title);
+        return;
+      }
       if (e.key==='Escape') { closeAc(); return; }
     }
-    if (e.key==='Enter') { const v=inp.value.trim(); if(v){closeAc();handleSearch(v);} }
+    if (e.key==='Enter') {
+      // Dropdown closed -- resolve raw input via Wikipedia before submitting
+      // so partial / typo inputs become a real canonical title.
+      const v = inp.value.trim();
+      if (!v) return;
+      e.preventDefault();
+      closeAc();
+      (async () => {
+        const canonical = await resolveToWikipediaTitle(v);
+        if (canonical) {
+          inp.value = canonical;
+          handleSearch(canonical);
+        } else {
+          showToast(`No Wikipedia article matches "${v}"`, 3500);
+        }
+      })();
+    }
   });
   inp.addEventListener('blur', () => setTimeout(closeAc, 160));
 
