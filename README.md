@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="screenshots/logo.png" alt="WikiPlex logo" width="180">
+</p>
+
 # WikiPlex
 
 WikiPlex grew out of [WikiDactic](https://wikidactic.com), a project that turns Wikipedia articles into structured learning courses. WikiPlex takes it further by turning all of Wikipedia into a living, explorable knowledge graph. You start from any article, and the system classifies it, maps its relationships to other topics, and generates study material on the spot. The result is a visual web of human knowledge that you can click through, study from, and keep building.
